@@ -4732,19 +4732,8 @@ test "Terminal: setTitle accepts its current value" {
     try testing.expectEqualStrings("Ghostty", t.getTitle().?);
 }
 
-// REVIEW: Replicated from `savemodes` in xterm's charproc.c:8053:
-// REVIEW:
-// REVIEW:   - 47, 1047 and 1049 all save `screen->whichBuf` into the
-// REVIEW:     single slot `DP_X_ALTBUF` (charproc.c:8184-8192), so they
-// REVIEW:     cannot disagree and they save the screen that is really
-// REVIEW:     active. We have three saved bits rather than one slot,
-// REVIEW:     so the same answer is written to each.
-// REVIEW:   - 1048 saves the cursor itself (charproc.c:8304-8308).
-// REVIEW:     There is no bit for it at all, and its XTRESTORE restores
-// REVIEW:     the cursor to match.
-// REVIEW:
-// REVIEW: Also see `SaveModes` (ptyx.h:2198), `DoSM` (ptyx.h:2281).
-//
+// Follows xterm's `savemodes` (charproc.c): 47, 1047 and 1049 share one
+// slot that holds the active screen, and 1048 saves the cursor itself.
 /// XTSAVE: capture a mode's current state for XTRESTORE.
 ///
 /// A captured value stays until the next save, so a restore
@@ -4773,19 +4762,10 @@ pub fn saveMode(self: *Terminal, mode: modespkg.Mode) void {
     }
 }
 
-// REVIEW: Replicated from `restoremodes` in xterm's charproc.c:8406.
-// REVIEW: The distinction matters because restoring is not setting:
-// REVIEW:
-// REVIEW:   - 47, 1047 and 1049 only switch buffers (charproc.c:8588-8612):
-// REVIEW:     `ToAlternate(xw, False)` or `FromAlternate(xw, False)`,
-// REVIEW:     where the `False` is `clearFirst` (charproc.c:9529, 9548).
-// REVIEW:     No erase and no cursor save or restore, so `?1049r` must
-// REVIEW:     not clear the screen the way `?1049h` does. Routing these
-// REVIEW:     through `setMode` is the bug reported in ghostty#14199.
-// REVIEW:   - 1048 restores the cursor (charproc.c:8671-8675).
-// REVIEW:
-// REVIEW: Also see `SaveModes` (ptyx.h:2198), `DoRM` (ptyx.h:2282).
-//
+// Follows xterm's `restoremodes` (charproc.c): 47, 1047 and 1049 only
+// switch buffers, with no erase and no cursor save or restore, so `?1049r`
+// does not clear the screen the way `?1049h` does (#14199). 1048 restores
+// the cursor.
 /// XTRESTORE: put a mode back to the state XTSAVE captured.
 ///
 /// Restoring is NOT setting.
@@ -4840,21 +4820,10 @@ pub fn restoreMode(self: *Terminal, mode: modespkg.Mode) !?bool {
     return null;
 }
 
-// REVIEW: Replicated from `do_dec_rqm` in xterm's misc.c:5466. xterm
-// REVIEW: answers several of these from real terminal state rather than
-// REVIEW: from a stored mode value:
-// REVIEW:
-// REVIEW:   - 47, 1047 and 1049 all report `screen->whichBuf`
-// REVIEW:     (misc.c:5610-5618), so they always agree with each other and
-// REVIEW:     with the screen on display. Reporting stored bits instead is
-// REVIEW:     the bug in ghostty-org/ghostty#14199: enter with `?47h`,
-// REVIEW:     leave with `?1049l`, and 47 still reports set.
-// REVIEW:   - 1048 reports `screen->sc[screen->whichBuf].saved` (misc.c:5716),
-// REVIEW:     that is whether a cursor is actually saved on the active screen,
-// REVIEW:     which a plain DECSC also sets. xterm seeds that flag for both
-// REVIEW:     screens at startup (`VTRealize` charproc.c:13066) and never
-// REVIEW:     clears it, so in xterm 1048 always reports set. We do not.
-//
+// Follows xterm's `do_dec_rqm` (misc.c): 47, 1047 and 1049 report the
+// active screen, and 1048 whether a cursor is saved on it. xterm saves a
+// cursor for both screens at startup, so it always reports 1048 set; we
+// report reset until something saves one.
 /// DECRQM: report a mode's state.
 ///
 /// Some modes are answered from the terminal's state rather than
@@ -4871,28 +4840,30 @@ pub fn modeReport(self: *const Terminal, mode: modespkg.Mode) modespkg.Report {
         else => return report,
     }
 
-    const set = switch (mode) {
-        else => return report,
+    return .{ .tag = report.tag, .state = if (self.modeGet(mode)) .set else .reset };
+}
 
-        // All three report the active screen.
+/// A mode's current value, as DECRQM reports it.
+///
+/// The alternate screen modes (47, 1047, 1049) and 1048 record no mode
+/// bit, so they are answered from the terminal's state: the three from
+/// the active screen, and 1048 from whether a cursor is saved on it,
+/// including by DECSC. Every other mode is its stored value.
+pub fn modeGet(self: *const Terminal, mode: modespkg.Mode) bool {
+    return switch (mode) {
         .alt_screen_legacy,
         .alt_screen,
         .alt_screen_save_cursor_clear_enter,
         => self.screens.active_key == .alternate,
 
-        // Whether a cursor is saved, including by DECSC.
         .save_cursor => self.screens.active.saved_cursor != null,
-    };
 
-    return .{ .tag = report.tag, .state = if (set) .set else .reset };
+        else => self.modes.get(mode),
+    };
 }
 
-// REVIEW: Replicated from `srm_SAVE_CURSOR` in xterm's
-// REVIEW: `dpmodes` (charproc.c:7915-7921).
-// REVIEW:
-// REVIEW: DECSC and DECRC are a separate path
-// REVIEW: (`CASE_DECSC` charproc.c:4906, `CASE_DECRC` charproc.c:4916).
-//
+// Follows `srm_SAVE_CURSOR` in xterm's `dpmodes` (charproc.c). DECSC and
+// DECRC take a separate path.
 /// Mode 1048: save the cursor on DECSET, restore it on DECRST.
 ///
 /// The saved cursor is the whole of this mode's state, so DECSC
