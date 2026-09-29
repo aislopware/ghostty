@@ -1773,7 +1773,7 @@ fn getTyped(
         .clipboard_write_max_bytes => out.* = wrapper.stream.handler.kitty_clipboard_write_max_bytes,
         .mode => {
             const mode = out.toMode() orelse return .invalid_value;
-            out.value = t.modes.get(mode);
+            out.value = t.modeGet(mode);
         },
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
     }
@@ -2644,6 +2644,44 @@ test "set and get mode" {
 
     config.value = true;
     try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&config)));
+    try testing.expectEqual(Result.success, get(t, .mode, @ptrCast(&config)));
+    try testing.expect(config.value);
+}
+
+test "get mode answers the alternate screen modes from the active screen" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const alt_modes = [_]u15{ 47, 1047, 1049 };
+    var config: ModeConfig = .{ .mode = undefined, .value = undefined };
+    const check = struct {
+        fn check(term: Terminal, c: *ModeConfig, expected: bool) !void {
+            for (alt_modes) |value| {
+                c.mode = @bitCast(modes.ModeTag{ .value = value, .ansi = false });
+                try testing.expectEqual(Result.success, get(term, .mode, @ptrCast(c)));
+                try testing.expectEqual(expected, c.value);
+            }
+        }
+    }.check;
+
+    // Enter with one mode, leave with another: all three follow the screen.
+    try check(t, &config, false);
+    vt_write(t, "\x1b[?47h", 6);
+    try check(t, &config, true);
+    vt_write(t, "\x1b[?1049l", 8);
+    try check(t, &config, false);
+
+    // 1048 is whether a cursor is saved, by DECSC too.
+    config.mode = @bitCast(modes.ModeTag{ .value = 1048, .ansi = false });
+    try testing.expectEqual(Result.success, get(t, .mode, @ptrCast(&config)));
+    try testing.expect(!config.value);
+    vt_write(t, "\x1b7", 2);
     try testing.expectEqual(Result.success, get(t, .mode, @ptrCast(&config)));
     try testing.expect(config.value);
 }
