@@ -642,10 +642,9 @@ pub const StreamHandler = struct {
         }
 
         switch (mode) {
-            // REVIEW: xterm keeps no live bit for these. `do_dec_rqm`
-            // REVIEW: answers 47, 1047 and 1049 from `screen->whichBuf`
-            // REVIEW: and 1048 from `screen->sc[whichBuf].saved`
-            // REVIEW: (misc.c:5610-5618, 5716).
+            // These keep no mode bit, as in xterm: DECRQM answers 47, 1047
+            // and 1049 from the active screen and 1048 from whether a cursor
+            // is saved (xterm misc.c `do_dec_rqm`).
             .alt_screen_legacy => return self.terminal.switchScreenMode(.@"47", enabled),
             .alt_screen => return self.terminal.switchScreenMode(.@"1047", enabled),
             .alt_screen_save_cursor_clear_enter => return self.terminal.switchScreenMode(.@"1049", enabled),
