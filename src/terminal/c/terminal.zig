@@ -191,6 +191,21 @@ pub const ProgressReport = extern struct {
     progress: i8,
 };
 
+/// Which part of its prompt the shell redraws after a resize, and so which
+/// part the terminal clears first.
+///
+/// C: GhosttyTerminalPromptRedraw
+pub const PromptRedraw = lib.Enum(lib.target, &.{
+    // The shell redraws nothing, and the terminal clears nothing.
+    "none",
+
+    // The shell redraws its whole prompt.
+    "full",
+
+    // The shell redraws the last row of its prompt only (bash).
+    "last",
+});
+
 /// C: GhosttySemanticPromptKind
 pub const SemanticPromptKind = Handler.SemanticPrompt.Kind;
 
@@ -1657,6 +1672,7 @@ pub const TerminalData = enum(c_int) {
     cursor_at_prompt = 39,
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
+    prompt_redraw = 42,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1672,6 +1688,7 @@ pub const TerminalData = enum(c_int) {
             .cursor_at_prompt,
             => bool,
             .mouse_shape => mouse.Shape,
+            .prompt_redraw => PromptRedraw,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
@@ -1841,6 +1858,11 @@ fn getTyped(
             out.value = t.modeGet(mode);
         },
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
+        .prompt_redraw => out.* = switch (t.flags.shell_redraws_prompt) {
+            .false => .none,
+            .true => .full,
+            .last => .last,
+        },
     }
 
     return .success;
@@ -3242,6 +3264,38 @@ test "get cursor_at_prompt" {
     vt_write(t, alternate_screen, alternate_screen.len);
     try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
     try testing.expect(!at_prompt);
+}
+
+test "get prompt_redraw" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var redraw: PromptRedraw = undefined;
+    try testing.expectEqual(Result.success, get(t, .prompt_redraw, @ptrCast(&redraw)));
+    try testing.expectEqual(PromptRedraw.none, redraw);
+
+    const full = "\x1b]133;A;redraw=1\x07";
+    vt_write(t, full, full.len);
+    try testing.expectEqual(Result.success, get(t, .prompt_redraw, @ptrCast(&redraw)));
+    try testing.expectEqual(PromptRedraw.full, redraw);
+
+    const last = "\x1b]133;A;redraw=last\x07";
+    vt_write(t, last, last.len);
+    try testing.expectEqual(Result.success, get(t, .prompt_redraw, @ptrCast(&redraw)));
+    try testing.expectEqual(PromptRedraw.last, redraw);
+
+    // A full reset returns to what the terminal started with, not to
+    // Ghostty's own default of redrawing the whole prompt.
+    const ris = "\x1bc";
+    vt_write(t, ris, ris.len);
+    try testing.expectEqual(Result.success, get(t, .prompt_redraw, @ptrCast(&redraw)));
+    try testing.expectEqual(PromptRedraw.none, redraw);
 }
 
 test "get active_screen" {
