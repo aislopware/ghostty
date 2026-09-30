@@ -4109,6 +4109,7 @@ pub fn resize(
         .reflow = self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
         .pull_scrollback = self.flags.resize_pull_scrollback,
+        .wraparound = self.modes.get(.wraparound),
     });
 
     // Alternate screen, if it exists, doesn't reflow. The primary resize
@@ -4123,6 +4124,7 @@ pub fn resize(
                 .rows = opts.rows,
                 .reflow = false,
                 .pull_scrollback = self.flags.resize_pull_scrollback,
+                .wraparound = self.modes.get(.wraparound),
             }) catch |err| break :resize err;
 
             // Resize succeeded.
@@ -16320,6 +16322,98 @@ test "Terminal: resize pending wrap live and saved cursors" {
             if (restore) t.saveCursor();
 
             try t.resize(alloc, .{ .cols = case.cols, .rows = 6 });
+            if (restore) t.restoreCursor();
+            try testing.expectEqual(case.pending_wrap, t.screens.active.cursor.pending_wrap);
+
+            try t.print('X');
+            const str = try t.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings(case.expected, str);
+        }
+    }
+}
+
+test "Terminal: resize pending wrap without wraparound stays on the last cell" {
+    const alloc = testing.allocator;
+    for ([_]bool{ false, true }) |restore| {
+        var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+        defer t.deinit(alloc);
+        t.modes.set(.wraparound, false);
+        try t.printString("ABCD");
+        if (restore) t.saveCursor();
+
+        try t.resize(alloc, .{ .cols = 6, .rows = 5 });
+        if (restore) t.restoreCursor();
+        try testing.expect(!t.screens.active.cursor.pending_wrap);
+        try testing.expectEqual(@as(size.CellCountInt, 3), t.screens.active.cursor.x);
+
+        // Like xterm, the next print overwrites the last cell written, and
+        // wraparound turned back on does not wrap in the middle of the row.
+        try t.print('X');
+        t.modes.set(.wraparound, true);
+        try t.print('Y');
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("ABCXY", str);
+    }
+}
+
+test "Terminal: resize pending wrap on the alternate screen" {
+    const alloc = testing.allocator;
+    const cases = [_]struct {
+        cols: size.CellCountInt,
+        pending_wrap: bool,
+        expected: []const u8,
+    }{
+        // Widening without reflow leaves room after the full line.
+        .{ .cols = 6, .pending_wrap = false, .expected = "ABCDX" },
+        // Narrowing without reflow clips the row and keeps the cursor at
+        // the new right edge, still pending wrap.
+        .{ .cols = 3, .pending_wrap = true, .expected = "ABC\nX" },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |restore| {
+            var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+            defer t.deinit(alloc);
+            try t.switchScreenMode(.@"1049", true);
+            try t.printString("ABCD");
+            if (restore) t.saveCursor();
+
+            try t.resize(alloc, .{ .cols = case.cols, .rows = 5 });
+            if (restore) t.restoreCursor();
+            try testing.expectEqual(case.pending_wrap, t.screens.active.cursor.pending_wrap);
+
+            try t.print('X');
+            const str = try t.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings(case.expected, str);
+        }
+    }
+}
+
+test "Terminal: resize pending wrap after a wide char that reflow moves" {
+    const alloc = testing.allocator;
+    const cases = [_]struct {
+        cols: size.CellCountInt,
+        pending_wrap: bool,
+        expected: []const u8,
+    }{
+        // The wide char no longer fits after "AB" and moves to the next
+        // row, leaving room after its tail.
+        .{ .cols = 3, .pending_wrap = false, .expected = "AB\n界X" },
+        // Its tail still fills the row.
+        .{ .cols = 2, .pending_wrap = true, .expected = "AB\n界\nX" },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |restore| {
+            var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+            defer t.deinit(alloc);
+            try t.printString("AB界");
+            if (restore) t.saveCursor();
+
+            try t.resize(alloc, .{ .cols = case.cols, .rows = 5 });
             if (restore) t.restoreCursor();
             try testing.expectEqual(case.pending_wrap, t.screens.active.cursor.pending_wrap);
 
