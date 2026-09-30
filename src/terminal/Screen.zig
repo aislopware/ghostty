@@ -2012,6 +2012,11 @@ pub const Resize = struct {
     /// Whether the resize may pull rows out of scrollback back into the
     /// active area. See PageList.Resize for details.
     pull_scrollback: bool = true,
+
+    /// Whether a pending wrap wraps on the next print (DEC mode 7). Without
+    /// wraparound, the next print overwrites the cell under the cursor, so a
+    /// cursor that resize moves off the right edge stays on that cell.
+    wraparound: bool = true,
 };
 
 const resize_tw = tripwire.module(enum {
@@ -2131,7 +2136,7 @@ pub inline fn resize(
     // advance to the next cell instead of wrapping on the next print.
     if (self.cursor.pending_wrap and self.cursor.x != opts.cols - 1) {
         self.cursor.pending_wrap = false;
-        self.cursorRight(1);
+        if (opts.wraparound) self.cursorRight(1);
     }
 
     // Clear any redrawable prompt after the fallible resize but before
@@ -2165,7 +2170,7 @@ pub inline fn resize(
             // reflect the correct next position.
             if (sc.pending_wrap and sc.x != opts.cols - 1) {
                 sc.pending_wrap = false;
-                sc.x += 1;
+                if (opts.wraparound) sc.x += 1;
             }
         } else {
             // I think this can happen if the screen is resized to be
