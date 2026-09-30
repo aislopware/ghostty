@@ -986,6 +986,30 @@ typedef void (*GhosttyTerminalDesktopNotificationFn)(
     const GhosttyTerminalDesktopNotification* notification);
 
 /**
+ * Which part of its prompt the shell redraws after a resize.
+ *
+ * Before reflowing the primary screen, the terminal clears the part of the
+ * prompt at the cursor that the shell says it will draw again. A shell
+ * reports this with the `redraw` option of OSC 133;A. A terminal starts at
+ * `GHOSTTY_TERMINAL_PROMPT_REDRAW_NONE`, and a full reset (RIS) returns to
+ * it.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The shell redraws nothing, so nothing is cleared. */
+  GHOSTTY_TERMINAL_PROMPT_REDRAW_NONE = 0,
+
+  /** The shell redraws its whole prompt (`redraw=1`). */
+  GHOSTTY_TERMINAL_PROMPT_REDRAW_FULL = 1,
+
+  /** The shell redraws only the last row of its prompt (`redraw=last`,
+   * bash). */
+  GHOSTTY_TERMINAL_PROMPT_REDRAW_LAST = 2,
+  GHOSTTY_TERMINAL_PROMPT_REDRAW_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalPromptRedraw;
+
+/**
  * State of a terminal progress report.
  *
  * @ingroup terminal
@@ -2452,6 +2476,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyMouseShape *
    */
   GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE = 41,
+
+  /**
+   * Which part of its prompt the shell redraws after a resize, as the last
+   * OSC 133;A with a `redraw` option said.
+   *
+   * Initially GHOSTTY_TERMINAL_PROMPT_REDRAW_NONE, and again after a full
+   * reset.
+   *
+   * Output type: GhosttyTerminalPromptRedraw *
+   */
+  GHOSTTY_TERMINAL_DATA_PROMPT_REDRAW = 42,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
