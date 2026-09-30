@@ -281,6 +281,27 @@ typedef struct {
 } GhosttyRenderStateOverscan;
 
 /**
+ * A borrowed view of the per-row dirty flags of a render state.
+ *
+ * One flag per row the last update captured, in the order the row
+ * iterator visits them: `ptr[i]` is the flag of the row the iterator
+ * reports at position `i`. The memory is owned by the render state and
+ * is the same memory GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY reads and
+ * GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY and ghostty_render_state_clean()
+ * write, so it always shows the current flags. It is only valid as long
+ * as the render state is not updated.
+ *
+ * @ingroup render
+ */
+typedef struct {
+  /** Pointer to len contiguous row dirty flags. */
+  const bool* ptr;
+
+  /** Number of rows. */
+  size_t len;
+} GhosttyRenderStateRowDirtyView;
+
+/**
  * The identity of a row across render state updates.
  *
  * Treat this value as opaque. Two ids are the same when both words are
@@ -396,6 +417,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  The next update uses this request. Both sides are zero if it was
    *  never set. */
   GHOSTTY_RENDER_STATE_DATA_OVERSCAN_REQUEST = 21,
+
+  /** A borrowed view of every captured row's dirty flag
+   *  (GhosttyRenderStateRowDirtyView), the bulk alternative to reading
+   *  GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY row by row. It reads the flags in
+   *  place, so one call serves a whole frame. The flags matter only while
+   *  GHOSTTY_RENDER_STATE_DATA_DIRTY is GHOSTTY_RENDER_STATE_DIRTY_PARTIAL:
+   *  a full redraw covers every row and a clean state none, whatever the
+   *  flags say, as with ghostty_render_state_row_iterator_next_dirty().
+   *  The view is only valid as long as the render state is not updated;
+   *  it is unsafe to use after updating the render state. */
+  GHOSTTY_RENDER_STATE_DATA_ROW_DIRTY = 22,
   GHOSTTY_RENDER_STATE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateData;
 
