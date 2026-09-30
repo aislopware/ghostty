@@ -16066,6 +16066,24 @@ test "Terminal: fullReset default modes" {
     try testing.expect(t.modes.get(.grapheme_cluster));
 }
 
+test "Terminal: fullReset resets the palette but not the dynamic colors" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    const original = t.colors.palette.current[2];
+    const purple: color.RGB = .{ .r = 0xff, .g = 0x00, .b = 0xff };
+    t.colors.palette.set(2, purple);
+    t.colors.background.set(purple);
+    try testing.expectEqual(purple, t.colors.palette.current[2]);
+
+    // As xterm: RIS resets the ANSI colors (OSC 4) and keeps the dynamic
+    // ones (OSC 10, 11, 12).
+    t.fullReset();
+    try testing.expectEqual(original, t.colors.palette.current[2]);
+    try testing.expectEqual(@as(usize, 0), t.colors.palette.mask.count());
+    try testing.expectEqual(purple, t.colors.background.get().?);
+}
+
 test "Terminal: fullReset default prompt redraw" {
     var t = try init(testing.io, testing.allocator, .{
         .cols = 10,
