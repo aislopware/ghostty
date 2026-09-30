@@ -3990,6 +3990,40 @@ test "semantic_prompt and reset effects are in stream order" {
     try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
 }
 
+test "semantic_prompt effect for a step longer than the OSC buffer" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var count: usize = 0;
+        var kind: Handler.SemanticPrompt.Kind = .invalid;
+        var command_len: usize = 0;
+
+        fn semanticPrompt(_: *Handler, event: Handler.SemanticPrompt) void {
+            count += 1;
+            kind = event.kind;
+            command_len = event.command.len;
+        }
+    };
+    S.count = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.semantic_prompt = &S.semanticPrompt;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // A long command line, as fish sends it, is cut: the step still
+    // starts the output, without the command.
+    s.nextSlice("\x1B]133;C;cmdline_url=");
+    for (0..osc.Parser.MAX_BUF) |_| s.nextSlice("ls%20");
+    s.nextSlice("\x07out");
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(Handler.SemanticPrompt.Kind.output_start, S.kind);
+    try testing.expectEqual(@as(usize, 0), S.command_len);
+    try testing.expectEqual(.output, t.screens.active.cursor.semantic_content);
+}
+
 test "reset effect callback" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
