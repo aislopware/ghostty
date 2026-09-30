@@ -801,6 +801,12 @@ pub const FromDecodedError = error{
     InvalidContinuation,
 };
 
+/// libghostty-vt embedders don't necessarily install Ghostty's shell
+/// integration, so don't assume OSC 133 prompts can be redrawn on resize,
+/// at start or after a full reset. Shells can still opt in with
+/// OSC 133;A;redraw=1.
+const c_default_prompt_redraw: osc.semantic_prompt.Redraw = .false;
+
 /// Transfer a core snapshot result into a caller-owned C terminal.
 ///
 /// `io` is the owner the decoded terminal was built with and is retained
@@ -820,6 +826,9 @@ pub fn fromDecoded(
     const native = alloc.create(ZigTerminal) catch
         return error.OutOfMemory;
     native.* = decoded.toOwned();
+    // A snapshot keeps the prompt redraw state, not the default a reset
+    // returns to, so restore the one every C terminal starts from.
+    native.default_prompt_redraw = c_default_prompt_redraw;
 
     const continuation = switch (decoded.continuation) {
         .ground => "",
@@ -908,14 +917,10 @@ fn new_(
         .{
             .cols = cols,
             .rows = rows,
+            .default_prompt_redraw = c_default_prompt_redraw,
         },
     );
     errdefer t.deinit(alloc);
-
-    // libghostty-vt embedders don't necessarily install Ghostty's shell
-    // integration, so don't assume OSC 133 prompts can be redrawn on resize.
-    // Shells can still opt in with OSC 133;A;redraw=1.
-    t.flags.shell_redraws_prompt = .false;
 
     return try wrap(
         alloc,
