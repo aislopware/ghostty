@@ -102,6 +102,11 @@ glyph_glossary: glyph.Glossary = .empty,
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
 
+/// What a full reset sets `flags.shell_redraws_prompt` back to. An embedder
+/// that doesn't install Ghostty's shell integration starts from `.false`,
+/// and a reset must not switch prompt clearing on behind its back.
+default_prompt_redraw: osc.semantic_prompt.Redraw = .true,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -306,6 +311,10 @@ pub const Options = struct {
     /// The checksum variant DECRQCRA computes after RIS or DECSTR.
     default_xt_checksum: xt_checksum.Flags = .{},
 
+    /// Whether the shell redraws its prompt after a resize until an OSC 133
+    /// prompt says otherwise, restored by RIS. See `flags.shell_redraws_prompt`.
+    default_prompt_redraw: osc.semantic_prompt.Redraw = .true,
+
     /// The total storage limit for Kitty images in bytes. Has no effect
     /// if kitty images are disabled at build-time.
     kitty_image_storage_limit: usize = switch (build_options.artifact) {
@@ -386,8 +395,10 @@ pub fn init(
             .default_blink = opts.default_cursor_blink,
         },
         .default_xt_checksum = opts.default_xt_checksum,
+        .default_prompt_redraw = opts.default_prompt_redraw,
     };
     result.flags.xt_checksum = opts.default_xt_checksum;
+    result.flags.shell_redraws_prompt = opts.default_prompt_redraw;
     result.setCursorStyle(.default);
     return result;
 }
@@ -6026,6 +6037,9 @@ pub fn fullReset(self: *Terminal) void {
         .resize_pull_scrollback = self.flags.resize_pull_scrollback,
 
         .xt_checksum = self.default_xt_checksum,
+
+        // Until the shell says otherwise again, as at start.
+        .shell_redraws_prompt = self.default_prompt_redraw,
     };
     self.modes.reset();
     self.tabstops.reset(TABSTOP_INTERVAL);
@@ -18608,6 +18622,25 @@ test "Terminal: fullReset default modes" {
     try testing.expect(t.modes.get(.grapheme_cluster));
     t.fullReset();
     try testing.expect(t.modes.get(.grapheme_cluster));
+}
+
+test "Terminal: fullReset default prompt redraw" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 10,
+        .default_prompt_redraw = .false,
+    });
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(.false, t.flags.shell_redraws_prompt);
+
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "redraw=1",
+    });
+    try testing.expectEqual(.true, t.flags.shell_redraws_prompt);
+
+    t.fullReset();
+    try testing.expectEqual(.false, t.flags.shell_redraws_prompt);
 }
 
 test "Terminal: fullReset tracked pins" {
