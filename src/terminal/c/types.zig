@@ -204,6 +204,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyRenderStateColors", render.Colors),
     .initStruct("GhosttyRenderStateCursor", render.Cursor),
     .initStruct("GhosttyRenderStateOverscan", render.Overscan),
+    .initStruct("GhosttyRenderStateRowDirtyView", render.RowDirtyView),
     .initStruct("GhosttyRenderStateRowId", render.RowId),
     .initStruct("GhosttyRenderStateRowSelection", render.RowSelection),
     .initStruct("GhosttySelection", selection.CSelection),
@@ -939,6 +940,16 @@ test "manifest describes render state overscan types" {
         .get("values").?.object;
     try std.testing.expectEqual(@as(i64, 20), data_values.get("OVERSCAN").?.integer);
     try std.testing.expectEqual(@as(i64, 21), data_values.get("OVERSCAN_REQUEST").?.integer);
+    try std.testing.expectEqual(@as(i64, 22), data_values.get("ROW_DIRTY").?.integer);
+
+    const row_dirty = manifest_types.get("GhosttyRenderStateRowDirtyView").?.object;
+    try std.testing.expectEqual(@as(i64, @sizeOf(render.RowDirtyView)), row_dirty.get("size").?.integer);
+    const row_dirty_fields = row_dirty.get("fields").?.object;
+    const flags = row_dirty_fields.get("ptr").?.object;
+    try std.testing.expectEqualStrings("pointer", flags.get("type").?.string);
+    try std.testing.expectEqualStrings("bool", flags.get("elem").?.string);
+    try std.testing.expect(flags.get("const").?.bool);
+    try std.testing.expectEqual(@as(i64, @sizeOf(usize)), row_dirty_fields.get("len").?.object.get("offset").?.integer);
 
     const row_data_values = manifest_types.get("GhosttyRenderStateRowData").?.object
         .get("values").?.object;

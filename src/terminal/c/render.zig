@@ -131,6 +131,12 @@ pub const Overscan = extern struct {
     }
 };
 
+/// C: GhosttyRenderStateRowDirtyView
+pub const RowDirtyView = extern struct {
+    ptr: ?[*]const bool,
+    len: usize,
+};
+
 /// C: GhosttyRenderStateRowId
 ///
 /// Opaque to C, where only equality is documented. The encoding is
@@ -200,6 +206,7 @@ pub const Data = enum(c_int) {
     colors = 19,
     overscan = 20,
     overscan_request = 21,
+    row_dirty = 22,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: Data) type {
@@ -218,6 +225,7 @@ pub const Data = enum(c_int) {
             .cursor => Cursor,
             .colors => Colors,
             .overscan, .overscan_request => Overscan,
+            .row_dirty => RowDirtyView,
         };
     }
 };
@@ -436,6 +444,13 @@ fn getTyped(
         .colors => return writeColors(state, out),
         .overscan => out.* = .init(state.state.overscan),
         .overscan_request => out.* = .init(state.overscan_request),
+        .row_dirty => {
+            // The rows the row iterator visits, so a position there is an
+            // index here.
+            const range = state.state.rowDataRange();
+            const dirty = state.state.row_data.items(.dirty)[range.start..range.end];
+            out.* = .{ .ptr = dirty.ptr, .len = dirty.len };
+        },
     }
 
     return .success;
@@ -3075,4 +3090,73 @@ test "render: overscan get_multi and row_get_multi" {
     try testing.expectEqual(row_keys.len, written);
     try testing.expectEqual(@as(i32, -1), vy);
     try testing.expect(!std.meta.eql(id, RowId{}));
+}
+
+test "render: row dirty view reads the row flags in place" {
+    const rows = 4;
+    const terminal = try testTerminalWithLines(10, rows, 20);
+    defer terminal_c.free(terminal);
+    terminal.?.terminal.scrollViewport(.{ .delta = -5 });
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    try testing.expectEqual(Result.invalid_value, get(state, .row_dirty, null));
+    const req: Overscan = .{ .above = 2, .below = 1 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    // Every captured row, overscan included, after the first (full) update.
+    var view: RowDirtyView = undefined;
+    try testing.expectEqual(Result.success, get(state, .row_dirty, @ptrCast(&view)));
+    try testing.expectEqual(@as(usize, 2 + rows + 1), view.len);
+    for (view.ptr.?[0..view.len]) |dirty| try testing.expect(dirty);
+
+    // A position of the row iterator is an index into the view, and a flag
+    // written through the iterator shows in a view taken before the write.
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+    var position: usize = 0;
+    while (row_iterator_next(it)) : (position += 1) {
+        const clean_row = position != 3;
+        if (clean_row) {
+            const value = false;
+            try testing.expectEqual(Result.success, row_set(it, .dirty, @ptrCast(&value)));
+        }
+        var dirty: bool = undefined;
+        try testing.expectEqual(Result.success, row_get(it, .dirty, @ptrCast(&dirty)));
+        try testing.expectEqual(dirty, view.ptr.?[position]);
+        try testing.expectEqual(!clean_row, view.ptr.?[position]);
+    }
+    try testing.expectEqual(view.len, position);
+
+    // Cleaning the state clears the flags under the view.
+    try testing.expectEqual(Result.success, clean(state));
+    for (view.ptr.?[0..view.len]) |dirty| try testing.expect(!dirty);
+
+    // The next update marks only the row that changed.
+    terminal.?.terminal.scrollViewport(.{ .bottom = {} });
+    terminal_c.vt_write(terminal, "\x1b[2;1H", 6);
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, clean(state));
+    terminal_c.vt_write(terminal, "x", 1);
+    try testing.expectEqual(Result.success, update(state, terminal));
+    var dirty_state: Dirty = undefined;
+    try testing.expectEqual(Result.success, get(state, .dirty, @ptrCast(&dirty_state)));
+    try testing.expectEqual(Dirty.partial, dirty_state);
+    try testing.expectEqual(Result.success, get(state, .row_dirty, @ptrCast(&view)));
+    var overscan: Overscan = undefined;
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&overscan)));
+    try testing.expectEqual(@as(usize, overscan.above + rows + overscan.below), view.len);
+    for (view.ptr.?[0..view.len], 0..) |dirty, i| {
+        try testing.expectEqual(i == overscan.above + 1, dirty);
+    }
 }
