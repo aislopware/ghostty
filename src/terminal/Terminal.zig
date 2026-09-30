@@ -16307,6 +16307,72 @@ test "Terminal: saved cursor survives repeated widening" {
     try testing.expectEqualStrings("abc\nAAA|X", str);
 }
 
+test "Terminal: saved cursors on both screens survive repeated widening" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Mode 1049 saves the primary cursor in pending wrap, and the
+    // alternate screen saves its own.
+    try t.printString("abc\nAAA|");
+    try t.switchScreenMode(.@"1049", true);
+    t.setCursorPos(1, 1);
+    try t.printString("def\nBBB|");
+    t.saveCursor();
+
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+    try t.resize(alloc, .{ .cols = 6, .rows = 5 });
+
+    t.restoreCursor();
+    try t.print('X');
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("def\nBBB|X", str);
+    }
+
+    try t.switchScreenMode(.@"1049", false);
+    try t.print('Y');
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("abc\nAAA|Y", str);
+    }
+}
+
+test "Terminal: resize keeps a cursor in blanks after a line that reflow wraps" {
+    const alloc = testing.allocator;
+    const cases = [_]struct {
+        text: []const u8,
+        col: usize,
+        cols: size.CellCountInt,
+        expected: []const u8,
+    }{
+        // The line wraps, the cursor stays two cells after its end.
+        .{ .text = "abcdef", .col = 8, .cols = 4, .expected = "abcd\nef X" },
+        // The line exactly fills a row, the cursor goes on the next one.
+        .{ .text = "abcd", .col = 7, .cols = 4, .expected = "abcd\n  X" },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |restore| {
+            var t = try init(testing.io, alloc, .{ .cols = 8, .rows = 5 });
+            defer t.deinit(alloc);
+            try t.printString(case.text);
+            t.setCursorPos(1, case.col);
+            if (restore) t.saveCursor();
+
+            try t.resize(alloc, .{ .cols = case.cols, .rows = 5 });
+            if (restore) t.restoreCursor();
+
+            try t.print('X');
+            const str = try t.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings(case.expected, str);
+        }
+    }
+}
+
 test "Terminal: resize pending wrap live and saved cursors" {
     const alloc = testing.allocator;
     const cases = [_]struct {
