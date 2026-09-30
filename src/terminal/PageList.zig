@@ -1688,6 +1688,16 @@ const ReflowCursor = struct {
             // Deferred line breaks and pending wrap reset the destination column.
             const dst_x = if (self.new_rows > 0 or self.pending_wrap) 0 else self.x;
 
+            // A pin in the blanks on the right moves no further than the
+            // end of the dst row where the content ends. The content may
+            // wrap, so this is measured from where the content ends, not
+            // from where the row starts, or the pin would land on content.
+            // It is fixed before the loop below grows cols_len, so every
+            // pin in the row gets the same bound.
+            const dst_cols: usize = self.page.size.cols;
+            const content_end: usize = @as(usize, dst_x) + cols_len;
+            const max_pin_x: usize = (content_end / dst_cols + 1) * dst_cols - 1 - dst_x;
+
             const pin_keys = list.tracked_pins.keys();
             for (pin_keys) |p| {
                 if (p.node != row.node or p.y != src_y) continue;
@@ -1697,13 +1707,7 @@ const ReflowCursor = struct {
 
                 if (cursor_pin != null and p == cursor_pin.?) continue;
 
-                // If this pin is in the blanks on the right and past the end
-                // of the dst col width then we move it to the end of the dst
-                // col width instead.
-                if (p.x >= cols_len) p.x = @min(
-                    p.x,
-                    self.page.size.cols - 1 - dst_x,
-                );
+                if (p.x > max_pin_x) p.x = @intCast(max_pin_x);
 
                 // We increase our col len to at least include this pin.
                 // This ensures that blank rows with pins are processed,
@@ -17970,6 +17974,98 @@ test "PageList resize reflow pin in blank cells after line break" {
             s.pointFromPin(.active, p.*).?,
         );
         try testing.expect(p.rowAndCell().cell.isEmpty());
+    }
+}
+
+test "PageList resize reflow pins in blank cells after content that wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct {
+        src_cols: size.CellCountInt,
+        first: []const u8,
+        // Soft-wrap the first row into a second row holding this text.
+        second: ?[]const u8 = null,
+        pin_y: size.CellCountInt,
+        pin_xs: []const size.CellCountInt,
+        cols: size.CellCountInt,
+        expected: []const point.Coordinate,
+    }{
+        // Narrowing wraps the content. Pins in the blanks after it stay
+        // after it, in order, instead of landing on its first row.
+        .{
+            .src_cols = 8,
+            .first = "abcdef",
+            .pin_y = 0,
+            .pin_xs = &.{ 6, 7 },
+            .cols = 4,
+            .expected = &.{ .{ .x = 2, .y = 1 }, .{ .x = 3, .y = 1 } },
+        },
+        // Content that exactly fills a destination row puts the pin on
+        // the next row, not on its last character.
+        .{
+            .src_cols = 8,
+            .first = "abcd",
+            .pin_y = 0,
+            .pin_xs = &.{6},
+            .cols = 4,
+            .expected = &.{.{ .x = 2, .y = 1 }},
+        },
+        // Pins far into the blanks clamp to the end of the row where the
+        // content ends.
+        .{
+            .src_cols = 8,
+            .first = "abcde",
+            .pin_y = 0,
+            .pin_xs = &.{7},
+            .cols = 3,
+            .expected = &.{.{ .x = 2, .y = 1 }},
+        },
+        // A soft continuation that overflows the destination row.
+        .{
+            .src_cols = 6,
+            .first = "abcdef",
+            .second = "ghij",
+            .pin_y = 1,
+            .pin_xs = &.{5},
+            .cols = 8,
+            .expected = &.{.{ .x = 3, .y = 1 }},
+        },
+    };
+
+    for (cases) |case| {
+        var s = try init(alloc, .{ .cols = case.src_cols, .rows = 4 });
+        defer s.deinit();
+        const page = s.pages.first.?.page();
+        const rows = [_]?[]const u8{ case.first, case.second };
+        for (rows, 0..) |text, y| {
+            for (text orelse continue, 0..) |cp, x| {
+                page.getRowAndCell(x, y).cell.* = .{
+                    .content_tag = .codepoint,
+                    .content = .{ .codepoint = .{ .data = cp } },
+                };
+            }
+        }
+        if (case.second != null) {
+            page.getRow(0).wrap = true;
+            page.getRow(1).wrap_continuation = true;
+        }
+
+        var pins: [2]*Pin = undefined;
+        for (case.pin_xs, 0..) |x, i| pins[i] = try s.trackPin(s.pin(.{ .active = .{
+            .x = x,
+            .y = case.pin_y,
+        } }).?);
+        defer for (pins[0..case.pin_xs.len]) |p| s.untrackPin(p);
+
+        try s.resize(.{ .cols = case.cols, .reflow = true });
+        for (pins[0..case.pin_xs.len], case.expected) |p, expected| {
+            try testing.expectEqual(
+                point.Point{ .active = expected },
+                s.pointFromPin(.active, p.*).?,
+            );
+            try testing.expect(p.rowAndCell().cell.isEmpty());
+        }
     }
 }
 
