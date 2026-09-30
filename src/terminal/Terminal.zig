@@ -5084,30 +5084,27 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
 pub fn fullReset(self: *Terminal) void {
     // Ensure we're back on primary screen
     self.screens.switchTo(.primary);
-    self.screens.remove(
-        self.screens.active.alloc,
-        .alternate,
-    );
 
-    // Reset our screen
+    // Remove alternate screen
+    self.screens.remove(self.screens.active.alloc, .alternate);
+
+    // Reset primary screen
     self.screens.active.reset();
 
     // Reset our basic state
-    const visible = self.flags.visible;
-    const resize_pull_scrollback = self.flags.resize_pull_scrollback;
-    self.modes.reset();
     self.flags = .{
         // Visibility belongs to the view rather than terminal state, so a
         // terminal reset must not make a hidden view potentially visible.
-        .visible = visible,
+        .visible = self.flags.visible,
 
         // This is configuration based on the pty rather than terminal
         // state, so a terminal reset must not change it.
-        .resize_pull_scrollback = resize_pull_scrollback,
+        .resize_pull_scrollback = self.flags.resize_pull_scrollback,
 
         // Until the shell says otherwise again, as at start.
         .shell_redraws_prompt = self.default_prompt_redraw,
     };
+    self.modes.reset();
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();
