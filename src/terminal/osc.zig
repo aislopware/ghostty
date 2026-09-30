@@ -568,6 +568,10 @@ pub const Parser = struct {
         backing: Backing,
         max_bytes: usize,
 
+        /// Bytes past `max_bytes` were dropped and the command is parsed
+        /// from what fit. Only set for commands that allow it.
+        truncated: bool = false,
+
         const Backing = union(enum) {
             fixed: std.Io.Writer,
             allocating: std.Io.Writer.Allocating,
@@ -781,6 +785,11 @@ pub const Parser = struct {
             // Already truncated: the write failed at the first bounds
             // check and there is nothing more to do.
             .unknown_truncated => {},
+            // A semantic prompt's step is in its first byte and its options
+            // are optional, so one too long for the buffer (a long command
+            // line in `cmdline_url`) keeps what fit instead of losing the
+            // step. The parser drops the option that was cut.
+            .@"133" => self.capture.?.truncated = true,
             else => self.state = .invalid,
         }
     }
