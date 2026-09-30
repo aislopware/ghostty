@@ -3957,6 +3957,40 @@ test "semantic_prompt effect callback" {
     try testing.expectEqual(@as(usize, 15), S.count);
 }
 
+test "semantic_prompt and reset effects are in stream order" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        // The cursor column at each event: the text before the sequence is
+        // printed, the text after it in the same slice is not yet.
+        var xs: [4]usize = undefined;
+        var len: usize = 0;
+
+        fn semanticPrompt(handler: *Handler, _: Handler.SemanticPrompt) void {
+            xs[len] = handler.terminal.screens.active.cursor.x;
+            len += 1;
+        }
+
+        fn reset(handler: *Handler) void {
+            xs[len] = handler.terminal.screens.active.cursor.x;
+            len += 1;
+        }
+    };
+    S.len = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.semantic_prompt = &S.semanticPrompt;
+    handler.effects.reset = &S.reset;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("ab\x1B]133;D;0\x07cdef\x1B]133;P\x1B\\gh\x1Bcxyz");
+    try testing.expectEqualSlices(usize, &.{ 2, 6, 0 }, S.xs[0..S.len]);
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
+}
+
 test "reset effect callback" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
