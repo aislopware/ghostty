@@ -1730,6 +1730,8 @@ pub const TerminalData = enum(c_int) {
     mouse_shape = 41,
     memory_usage = 42,
     prompt_redraw = 43,
+    cursor_semantic_content = 44,
+    cursor_semantic_clear_eol = 45,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1743,7 +1745,9 @@ pub const TerminalData = enum(c_int) {
             .vt_processing_error,
             .vt_ground,
             .cursor_at_prompt,
+            .cursor_semantic_clear_eol,
             => bool,
+            .cursor_semantic_content => cell_c.SemanticContent,
             .mouse_shape => mouse.Shape,
             .prompt_redraw => PromptRedraw,
             .active_screen => TerminalScreen,
@@ -1929,6 +1933,10 @@ fn getTyped(
             if (out.size < @sizeOf(TerminalMemoryUsage)) return .invalid_value;
             out.* = .init(t, out.size);
         },
+        .cursor_semantic_content => out.* = @enumFromInt(
+            @intFromEnum(t.screens.active.cursor.semantic_content),
+        ),
+        .cursor_semantic_clear_eol => out.* = t.screens.active.cursor.semantic_content_clear_eol,
         .prompt_redraw => out.* = switch (t.flags.shell_redraws_prompt) {
             .false => .none,
             .true => .full,
@@ -3499,6 +3507,42 @@ test "get prompt_redraw" {
     vt_write(t, ris, ris.len);
     try testing.expectEqual(Result.success, get(t, .prompt_redraw, @ptrCast(&redraw)));
     try testing.expectEqual(PromptRedraw.none, redraw);
+}
+
+test "get cursor_semantic_content" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var content: cell_c.SemanticContent = undefined;
+    var clear_eol: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_semantic_content, @ptrCast(&content)));
+    try testing.expectEqual(cell_c.SemanticContent.output, content);
+
+    const prompt = "\x1b]133;A\x07$ ";
+    vt_write(t, prompt, prompt.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_semantic_content, @ptrCast(&content)));
+    try testing.expectEqual(cell_c.SemanticContent.prompt, content);
+
+    const input = "\x1b]133;I\x07ls";
+    vt_write(t, input, input.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_semantic_content, @ptrCast(&content)));
+    try testing.expectEqual(cell_c.SemanticContent.input, content);
+    try testing.expectEqual(Result.success, get(t, .cursor_semantic_clear_eol, @ptrCast(&clear_eol)));
+    try testing.expect(clear_eol);
+
+    // The end of the line ends input that ends there.
+    const newline = "\r\n";
+    vt_write(t, newline, newline.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_semantic_content, @ptrCast(&content)));
+    try testing.expectEqual(cell_c.SemanticContent.output, content);
+    try testing.expectEqual(Result.success, get(t, .cursor_semantic_clear_eol, @ptrCast(&clear_eol)));
+    try testing.expect(!clear_eol);
 }
 
 test "get active_screen" {

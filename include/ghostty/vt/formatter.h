@@ -116,6 +116,12 @@ typedef struct {
   /** Optional selection to restrict output to a range.
    *  If NULL, the entire screen is formatted. */
   const GhosttySelection *selection;
+
+  /** For VT, emit every row's prompt flag and every cell's semantic
+   *  content (OSC 133), so a replay into a fresh terminal restores them.
+   *  Rows with no text but a prompt flag are emitted too. No effect when
+   *  unwrap is set. */
+  bool semantic_prompt;
 } GhosttyFormatterTerminalOptions;
 
 /**

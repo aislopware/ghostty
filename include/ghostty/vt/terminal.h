@@ -2610,6 +2610,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalPromptRedraw *
    */
   GHOSTTY_TERMINAL_DATA_PROMPT_REDRAW = 43,
+
+  /**
+   * The semantic content type (OSC 133) the cursor writes cells with:
+   * output, input or prompt.
+   *
+   * Output type: GhosttyCellSemanticContent *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_SEMANTIC_CONTENT = 44,
+
+  /**
+   * Whether the cursor's input content ends at the end of the line
+   * (OSC 133;I), so the next newline returns it to output.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_SEMANTIC_CLEAR_EOL = 45,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
