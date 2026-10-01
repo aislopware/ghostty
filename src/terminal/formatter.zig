@@ -1454,21 +1454,57 @@ pub const PageFormatter = struct {
             // work later. If it isn't blank, make sure we dump all our
             // blanks. A row with no text keeps its prompt flag when the
             // semantic prompt state is emitted.
+            // A blank row the replay must wrap from is written like one with
+            // text (as blanks), since a replay wraps only on what follows.
             if (!Cell.hasTextAny(cells_subset) and
-                !(semantic and row.semantic_prompt != .none))
+                !(semantic and row.semantic_prompt != .none) and
+                !(vt_join and row.wrap))
             {
-                // A replay wraps only on the text that follows, so a row
-                // left to wrap into one with none ends with a newline.
                 if (joined) |flag| {
-                    if (semantic) try replay.endRow(
-                        &self,
-                        writer,
-                        flag,
-                        self.page.size.cols - 1,
-                        y -| 1,
-                    );
+                    if (row.wrap_continuation) {
+                        // The replay wraps into this row on a blank written
+                        // after the rest of the row before: unstyled, outside
+                        // any hyperlink, and output.
+                        if (comptime formatStyled(emit)) {
+                            if (current_hyperlink_id != null) {
+                                try self.formatHyperlinkClose(emit, writer);
+                                current_hyperlink_id = null;
+                            }
+                            if (!style.default()) {
+                                try self.formatStyleClose(emit, writer);
+                                style = .{};
+                                style_id = 0;
+                            }
+                        }
+                        if (semantic) try replay.content_to(
+                            &self,
+                            writer,
+                            .output,
+                            self.page.size.cols - 1,
+                            y -| 1,
+                        );
+                        try writer.splatByteAll(' ', blank_cells + 1);
+                        if (self.point_map) |*map| try self.appendBlankPoints(
+                            map,
+                            blank_cells + 1,
+                            1,
+                            y,
+                        );
+                        replay = .{};
+                        blank_cells = 0;
+                    } else {
+                        // The row before was soft-wrapped, but not into this
+                        // one (a line was inserted or deleted between).
+                        if (semantic) try replay.endRow(
+                            &self,
+                            writer,
+                            flag,
+                            self.page.size.cols - 1,
+                            y -| 1,
+                        );
+                        blank_rows += 1;
+                    }
                     joined = null;
-                    blank_rows += 1;
                 }
                 blank_rows += 1;
                 continue;
@@ -1482,7 +1518,11 @@ pub const PageFormatter = struct {
                 const first = &cells_subset[0];
                 const first_content: Cell.SemanticContent =
                     if (first.isEmpty() and !first.hasStyling()) .output else first.semantic_content;
-                const wrap: SemanticReplay.Wrap = if (semantic)
+                // A row the row before was soft-wrapped into, unless a line
+                // was inserted or deleted between them.
+                const wrap: SemanticReplay.Wrap = if (!row.wrap_continuation)
+                    .newline
+                else if (semantic)
                     replay.wrapInto(row.semantic_prompt, first_content)
                 else
                     .{ .wraps = null };
@@ -1501,7 +1541,7 @@ pub const PageFormatter = struct {
                         y,
                     );
                 } else {
-                    try replay.endRow(
+                    if (semantic) try replay.endRow(
                         &self,
                         writer,
                         flag,
@@ -7545,6 +7585,41 @@ test "Page VT unwrap replays soft wraps after a resize reflowed them" {
     s.nextSlice("0123456789abcdefghijklmn\r\nshort\r\n\x1b]133;C\x07a longer line of output");
     try t.resize(alloc, .{ .cols = 8, .rows = 7 });
     try expectVtUnwrapReplayForTest(&t, true);
+}
+
+test "Page VT unwrap replays soft wraps into and out of blank rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Twenty blanks, written as spaces, reflowed at ten columns, then
+    // erased so that both rows of the line have no text; and a line that
+    // wraps into a row erased afterwards.
+    var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 6 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("x                    y\r\nabc\r\n0123456789abcdefghijkl\x1b[5;1H\x1b[2K\x1b[6;1Hz");
+    try t.resize(alloc, .{ .cols = 10, .rows = 10 });
+    s.nextSlice("\x1b[1;1H\x1b[2K\x1b[2;1H\x1b[2K");
+    try expectVtUnwrapReplayForTest(&t, true);
+}
+
+test "Page VT unwrap leaves a soft wrap to a row that was moved away" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // A line inserted after the wrapped row pushes its continuation down.
+    var t = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("0123456789abc\x1b[2;1H\x1b[L");
+    try expectVtUnwrapReplayForTest(&t, false);
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("0123456789\n\nabc", str);
 }
 
 test "Page VT unwrap gives a row wrapped into the flag the wrap does not" {
