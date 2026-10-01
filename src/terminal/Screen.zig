@@ -1574,6 +1574,14 @@ pub inline fn cursorMarkDirty(self: *Screen) void {
     self.cursor.page_row.dirty = true;
 }
 
+/// Give the cursor's row the prompt flag `flag`, dirtying the row when the
+/// flag changes: a render state copies the flag with the row.
+pub inline fn cursorSetRowSemanticPrompt(self: *Screen, flag: Row.SemanticPrompt) void {
+    if (self.cursor.page_row.semantic_prompt == flag) return;
+    self.cursor.page_row.semantic_prompt = flag;
+    self.cursorMarkDirty();
+}
+
 /// Reset the cursor row's soft-wrap state and the cursor's pending wrap.
 /// Also handles clearing the spacer head on the cursor row and resetting
 /// the wrap_continuation flag on the next row if necessary.
@@ -2869,10 +2877,10 @@ pub fn cursorSetSemanticContent(self: *Screen, t: union(enum) {
             self.semantic_prompt.seen = true;
             cursor.semantic_content = .prompt;
             cursor.semantic_content_clear_eol = false;
-            cursor.page_row.semantic_prompt = switch (kind) {
+            self.cursorSetRowSemanticPrompt(switch (kind) {
                 .initial, .right => .prompt,
                 .continuation, .secondary => .prompt_continuation,
-            };
+            });
         },
     }
 }
@@ -3735,7 +3743,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                 self.cursorSetSemanticContent(.output);
             } else switch (self.cursor.semantic_content) {
                 .output => {},
-                .prompt, .input => self.cursor.page_row.semantic_prompt = .prompt_continuation,
+                .prompt, .input => self.cursorSetRowSemanticPrompt(.prompt_continuation),
             }
             continue;
         }
@@ -3771,7 +3779,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             self.cursor.page_row.wrap_continuation = true;
             switch (self.cursor.semantic_content) {
                 .output => {},
-                .input, .prompt => self.cursor.page_row.semantic_prompt = .prompt_continuation,
+                .input, .prompt => self.cursorSetRowSemanticPrompt(.prompt_continuation),
             }
         }
 

@@ -2828,6 +2828,11 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     for (0..page.size.rows) |i| {
                         const row = &rows[i];
                         page.clearCells(row, cols, self.cols);
+
+                        // A wide character the new edge cuts in half has
+                        // lost its spacer tail and no longer fits.
+                        const cells = page.getCells(row);
+                        if (cells[cols - 1].wide == .wide) page.clearCells(row, cols - 1, cols);
                     }
 
                     page.size.cols = cols;
@@ -15379,6 +15384,36 @@ test "PageList resize (no reflow) less cols clears graphemes" {
     while (it.next()) |chunk| {
         try testing.expectEqual(@as(usize, 0), chunk.node.page().graphemeCount());
     }
+}
+
+test "PageList resize (no reflow) less cols clears a wide character it cuts" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 2, .max_size = 0 });
+    defer s.deinit();
+
+    // A wide character in columns 4 and 5.
+    const page = s.pages.first.?.page();
+    {
+        const rac = page.getRowAndCell(4, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 0x1F600 } },
+            .wide = .wide,
+        };
+        const tail = page.getRowAndCell(5, 0);
+        tail.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 0 } },
+            .wide = .spacer_tail,
+        };
+    }
+
+    try s.resize(.{ .cols = 5, .reflow = false });
+    const cell = s.getCell(.{ .active = .{ .x = 4, .y = 0 } }).?.cell;
+    try testing.expect(cell.isEmpty());
+    try testing.expectEqual(pagepkg.Cell.Wide.narrow, cell.wide);
 }
 
 test "PageList resize (no reflow) more cols" {
