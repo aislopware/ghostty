@@ -876,12 +876,20 @@ pub const ScreenFormatter = struct {
             .{ y -| origin.y + 1, start_x -| origin.x + 1 },
         );
 
-        // Reformat the cell which sets the proper pending wrap state.
+        // Reformat the cell which sets the proper pending wrap state. An
+        // empty cell formats as nothing, so it is written as the blank it
+        // draws as.
+        const cell = pin.rowAndCell().cell;
+        if (cell.isEmpty() and !cell.hasStyling() and !cell.hyperlink) {
+            try writer.writeByte(' ');
+            return;
+        }
         var cell_formatter: PageFormatter = .init(pin.node.page(), self.opts);
         cell_formatter.start_x = x;
         cell_formatter.end_x = x;
         cell_formatter.start_y = pin.y;
         cell_formatter.end_y = pin.y;
+        cell_formatter.lone_cell = true;
         try cell_formatter.format(writer);
     }
 
@@ -1119,6 +1127,15 @@ const SemanticReplay = struct {
     /// How input content is started: with `I` rather than `B`.
     input_eol: bool = false,
 
+    /// The replay's content is not known, so the next cell's is set
+    /// whatever it is (a cell formatted alone, see `PageFormatter.lone_cell`).
+    known: bool = true,
+
+    /// A cell formatted alone into a row the terminal already holds: the
+    /// row's flag must stay, so prompt content on an unflagged row, which
+    /// only `P` gives and `P` flags the row, is written as output.
+    lone: bool = false,
+
     fn emit(
         fmt: *const PageFormatter,
         writer: *std.Io.Writer,
@@ -1154,11 +1171,14 @@ const SemanticReplay = struct {
         self: *SemanticReplay,
         fmt: *const PageFormatter,
         writer: *std.Io.Writer,
-        want: Cell.SemanticContent,
+        wanted: Cell.SemanticContent,
         x: size.CellCountInt,
         y: size.CellCountInt,
     ) std.Io.Writer.Error!void {
-        if (self.content == want and (want != .input or self.eol == self.input_eol)) return;
+        const want: Cell.SemanticContent =
+            if (self.lone and wanted == .prompt and self.row == .none) .output else wanted;
+        if (self.known and self.content == want and (want != .input or self.eol == self.input_eol)) return;
+        self.known = true;
         switch (want) {
             // Prompt content on an unflagged row flags it; `endRow`
             // takes the flag off again.
@@ -1502,6 +1522,12 @@ pub const PageFormatter = struct {
     /// over multiple pages this helps ensure that unwrapping and other
     /// accounting works properly.
     trailing_state: ?TrailingState,
+
+    /// The output writes one cell again into a terminal that already holds
+    /// its row, as the cursor extra does to restore a pending wrap. A VT
+    /// replay's semantic prompt state then gives the cell its own content
+    /// and leaves the row's flag and the cursor's column as they are.
+    lone_cell: bool = false,
 
     /// See point_map.
     pub const PointMap = struct {
@@ -1935,7 +1961,9 @@ pub const PageFormatter = struct {
             // The replay's cursor stands at the start of a row it has not
             // flagged, with output content (see the end of the row below),
             // unless it wrapped into this row.
-            if (semantic and joined == null) {
+            if (semantic and joined == null and self.lone_cell) {
+                replay = .{ .row = row.semantic_prompt, .known = false, .lone = true };
+            } else if (semantic and joined == null) {
                 replay = .{};
                 switch (row.semantic_prompt) {
                     .none => {},
@@ -1955,7 +1983,7 @@ pub const PageFormatter = struct {
                 // avoiding all of the per-cell bookkeeping below. This is
                 // only valid when we have no codepoint map and when our
                 // current style/hyperlink state is known-stable.
-                if (cp_map_empty and wrap_fix == null) fast: {
+                if (cp_map_empty and wrap_fix == null and !self.lone_cell) fast: {
                     if (comptime formatStyled(emit)) {
                         if (style_id == invalid_style_id) break :fast;
                     }
@@ -2299,7 +2327,7 @@ pub const PageFormatter = struct {
             if (vt_join and row.wrap) {
                 joined = row.semantic_prompt;
             } else {
-                if (semantic) try replay.endRow(
+                if (semantic and !self.lone_cell) try replay.endRow(
                     &self,
                     writer,
                     row.semantic_prompt,
@@ -6320,6 +6348,57 @@ test "Terminal vt cursor counts from the margins in origin mode" {
         try testing.expectEqual(want.x, got.x);
         try testing.expectEqual(want.y, got.y);
         try testing.expectEqual(want.pending_wrap, got.pending_wrap);
+    }
+}
+
+test "Terminal vt cursor keeps a pending wrap on a prompt row with its semantic state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        "\x1b]133;A\x1b\\abcd",
+        "\x1b]133;A\x1b\\ab\x1b]133;B\x1b\\cd",
+        "\x1b]133;C\x1b\\abcd",
+        // Prompt content on a row the prompt did not flag.
+        "\x1b]133;A\x1b\\x\r\nabcd",
+        // The alternate screen takes the cursor's prompt content onto a row
+        // it never flagged.
+        "\r\n\x1b]133;A\x1b\\x\x1b[?1049h\x1b[2;2Habc",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+        try testing.expect(source.screens.active.cursor.pending_wrap);
+
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: TerminalFormatter = .init(&source, .vt);
+        formatter.extra = .all;
+        formatter.opts.semantic_prompt = true;
+        formatter.opts.unwrap = true;
+        formatter.opts.trim = false;
+        try formatter.format(&builder.writer);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
+        defer target.deinit(alloc);
+        var target_stream = target.vtStream();
+        defer target_stream.deinit();
+        target_stream.nextSlice(builder.writer.buffered());
+
+        const want = &source.screens.active.cursor;
+        const got = &target.screens.active.cursor;
+        try testing.expectEqual(want.x, got.x);
+        try testing.expectEqual(want.y, got.y);
+        try testing.expect(got.pending_wrap);
+        try testing.expectEqual(want.page_row.semantic_prompt, got.page_row.semantic_prompt);
+        // Prompt content on a row with no prompt flag comes back as output:
+        // only `P` gives prompt content, and it flags the row.
+        const content: Cell.SemanticContent = if (want.page_row.semantic_prompt == .none and
+            want.page_cell.semantic_content == .prompt) .output else want.page_cell.semantic_content;
+        try testing.expectEqual(content, got.page_cell.semantic_content);
     }
 }
 
