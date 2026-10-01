@@ -854,8 +854,16 @@ pub const ScreenFormatter = struct {
         else
             .{ .x = 0, .y = 0 };
 
+        // The column a print leaves a pending wrap in: the right margin,
+        // or past it the last column, as `Terminal.print` reads it. The
+        // margins are already set when the cursor is formatted.
+        const right_edge: size.CellCountInt = if (self.terminal) |t|
+            if (x <= t.scrolling_region.right) t.scrolling_region.right else self.screen.pages.cols - 1
+        else
+            self.screen.pages.cols - 1;
+
         // If we don't have pending wrap, then we can just use CUP.
-        if (!pending_wrap or x != self.screen.pages.cols - 1) {
+        if (!pending_wrap or x != right_edge) {
             try writer.print("\x1b[{d};{d}H", .{ y -| origin.y + 1, x -| origin.x + 1 });
             return;
         }
@@ -6448,6 +6456,58 @@ test "Terminal vt cursor keeps a pending wrap on a prompt row with its semantic 
         const content: Cell.SemanticContent = if (!flagged and
             want.page_cell.semantic_content == .prompt) .output else want.page_cell.semantic_content;
         try testing.expectEqual(content, got.page_cell.semantic_content);
+    }
+}
+
+test "Terminal vt cursor keeps a pending wrap at the right margin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_]struct { input: []const u8, saved: bool }{
+        .{ .input = "\x1b[?69h\x1b[2;5s\x1b[1;2Habcd", .saved = false },
+        // Under origin mode, and saved with DECSC.
+        .{ .input = "\x1b[?69h\x1b[2;5s\x1b[?6habcd", .saved = false },
+        .{ .input = "\x1b[?69h\x1b[2;5s\x1b[1;2Habcd\x1b7\x1b[3;1H", .saved = true },
+    }) |case| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 3 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(case.input);
+
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: TerminalFormatter = .init(&source, .vt);
+        formatter.extra = .all;
+        try formatter.format(&builder.writer);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 3 });
+        defer target.deinit(alloc);
+        var target_stream = target.vtStream();
+        defer target_stream.deinit();
+        target_stream.nextSlice(builder.writer.buffered());
+
+        const At = struct { x: size.CellCountInt, y: size.CellCountInt, pending_wrap: bool };
+        const want: At, const got: At = if (case.saved) .{
+            .{ .x = source.screens.active.saved_cursor.?.x, .y = source.screens.active.saved_cursor.?.y, .pending_wrap = source.screens.active.saved_cursor.?.pending_wrap },
+            .{ .x = target.screens.active.saved_cursor.?.x, .y = target.screens.active.saved_cursor.?.y, .pending_wrap = target.screens.active.saved_cursor.?.pending_wrap },
+        } else .{
+            .{ .x = source.screens.active.cursor.x, .y = source.screens.active.cursor.y, .pending_wrap = source.screens.active.cursor.pending_wrap },
+            .{ .x = target.screens.active.cursor.x, .y = target.screens.active.cursor.y, .pending_wrap = target.screens.active.cursor.pending_wrap },
+        };
+        try testing.expect(want.pending_wrap);
+        try testing.expectEqual(want, got);
+
+        // What is written next wraps to the left margin in both.
+        const next = if (case.saved) "\x1b8x" else "x";
+        source_stream.nextSlice(next);
+        target_stream.nextSlice(next);
+        const plain_source = try source.plainString(alloc);
+        defer alloc.free(plain_source);
+        const plain_target = try target.plainString(alloc);
+        defer alloc.free(plain_target);
+        try testing.expectEqualStrings(plain_source, plain_target);
     }
 }
 

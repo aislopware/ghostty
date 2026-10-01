@@ -6021,7 +6021,7 @@ fn expectBackgroundRowsFlaggedForTest(t: *Terminal) !void {
 }
 
 test "Terminal: a row holding a cell with only a background is flagged" {
-    const cases = [_]struct { input: []const u8, cols: size.CellCountInt = 0, rows: size.CellCountInt = 0 }{
+    const cases = [_]struct { input: []const u8, cols: size.CellCountInt = 0, rows: size.CellCountInt = 0, height: size.CellCountInt = 4 }{
         // An erase under a coloured pen.
         .{ .input = "ab\x1b[41m\x1b[K" },
         // A scroll under one.
@@ -6029,6 +6029,14 @@ test "Terminal: a row holding a cell with only a background is flagged" {
         // The whole screen erased under one, and the alternate screen too.
         .{ .input = "x\x1b[41m\x1b[2J" },
         .{ .input = "\x1b[?1049hx\x1b[41m\x1b[2J" },
+        // Lines deleted and inserted under one, and a reverse index at the
+        // top, whose rows are reset after the fill.
+        .{ .input = "ab\x1b[41m\x1b[M" },
+        .{ .input = "ab\x1b[41m\x1b[L" },
+        .{ .input = "ab\x1b[41m\x1bM" },
+        // A scroll on a screen with no scrollback and on one of one row.
+        .{ .input = "\x1b[?1049hab\x1b[41m\x1b[4;1H\n" },
+        .{ .input = "ab\x1b[41m\n", .height = 1 },
         // Characters inserted and deleted around the colour.
         .{ .input = "\x1b[41m\x1b[2K\x1b[0m\x1b[3G\x1b[2@\x1b[2P" },
         // Reflowed narrower and wider.
@@ -6036,7 +6044,7 @@ test "Terminal: a row holding a cell with only a background is flagged" {
         .{ .input = "\x1b[41m\x1b[2K\x1b[0mx", .cols = 10, .rows = 4 },
     };
     for (cases) |case| {
-        var t = try init(testing.io, testing.allocator, .{ .cols = 6, .rows = 4 });
+        var t = try init(testing.io, testing.allocator, .{ .cols = 6, .rows = case.height });
         defer t.deinit(testing.allocator);
         var s = t.vtStream();
         defer s.deinit();
