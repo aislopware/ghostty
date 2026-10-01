@@ -1128,7 +1128,20 @@ const SemanticReplay = struct {
             .above = post,
         };
         if (width >= cols) {
-            if (fix.above != null) return null;
+            if (fix.above != null) {
+                // A single column whose prompt flag is to come off before a
+                // prompt prints there: the flag comes off, the column prints
+                // as output, and it prints again as the prompt it is, the
+                // cursor back on it.
+                if (cols > 1) return null;
+                return .{
+                    .fix = .{},
+                    .pre = .none,
+                    .wrapped = .none,
+                    .input_eol = false,
+                    .reprint = flag,
+                };
+            }
             if (fix.row == .none and cols > 1) return null;
         }
         return .{ .fix = fix, .pre = pre, .wrapped = wrapped, .input_eol = input_eol };
@@ -1145,6 +1158,10 @@ const SemanticReplay = struct {
 
         /// Input the row starts with ends at the end of the line.
         input_eol: bool,
+
+        /// The first column prints as output, then again as prompt content
+        /// with the row flagged this.
+        reprint: ?Row.SemanticPrompt = null,
     };
 
     /// Set the content the first column of the row `plan` wraps into prints
@@ -1171,8 +1188,41 @@ const SemanticReplay = struct {
             },
         };
         if (first == .input) self.input_eol = plan.input_eol;
-        try self.content_to(fmt, writer, first, cols - 1, y);
+        const content: Cell.SemanticContent = if (plan.reprint != null) .output else first;
+        try self.content_to(fmt, writer, content, cols - 1, y);
         self.row = plan.wrapped;
+    }
+
+    /// Before the first column of a single column is printed again: back on
+    /// it, with the row flagged `flag` and prompt content.
+    fn beforeReprint(
+        self: *SemanticReplay,
+        fmt: *const PageFormatter,
+        writer: *std.Io.Writer,
+        flag: Row.SemanticPrompt,
+        y: size.CellCountInt,
+    ) std.Io.Writer.Error!void {
+        try emit(fmt, writer, "\r", 0, y);
+        switch (flag) {
+            .prompt_continuation => try self.prompt(fmt, writer, "c", 0, y),
+            .prompt, .none => try self.prompt(fmt, writer, "i", 0, y),
+        }
+    }
+
+    /// After it was printed again: a row not flagged takes the flag off,
+    /// the cursor still at the first column.
+    fn afterReprint(
+        self: *SemanticReplay,
+        fmt: *const PageFormatter,
+        writer: *std.Io.Writer,
+        flag: Row.SemanticPrompt,
+        y: size.CellCountInt,
+    ) std.Io.Writer.Error!void {
+        if (flag != .none) return;
+        try emit(fmt, writer, "\x1b]133;C\x1b\\", 0, y);
+        self.content = .output;
+        self.eol = false;
+        self.row = .none;
     }
 
     /// Set right the flags a wrap into this row left wrong, with the cursor
@@ -1560,6 +1610,10 @@ pub const PageFormatter = struct {
 
         const cols = self.page.size.cols;
 
+        // The first column of a single column the replay wrapped into, to be
+        // printed again as the prompt it is with the row flagged this.
+        var reprint: ?Row.SemanticPrompt = null;
+
         for (start_y..end_y + 1) |y_usize| {
             const y: size.CellCountInt = @intCast(y_usize);
             const row: *Row = self.page.getRow(y);
@@ -1670,6 +1724,7 @@ pub const PageFormatter = struct {
                     // one content writes no step of its own.
                     if (semantic) try replay.wrap(&self, writer, p, first_content, cols, y -| 1);
                     wrap_fix = p.fix;
+                    reprint = p.reprint;
                 } else {
                     try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
                     try self.enterUnwritten(writer, &replay, semantic, &wrap_fix, y);
@@ -2030,7 +2085,8 @@ pub const PageFormatter = struct {
                     }
                 }
 
-                if (semantic) try replay.content_to(
+                // A column printed again prints as output first.
+                if (semantic and reprint == null) try replay.content_to(
                     &self,
                     writer,
                     cell.semantic_content,
@@ -2043,6 +2099,12 @@ pub const PageFormatter = struct {
                     // shared style handling. We use comptime to dup it.
                     inline .codepoint, .codepoint_grapheme => |tag| {
                         try self.writeCell(tag, emit, writer, cell);
+                        if (reprint) |flag| {
+                            try replay.beforeReprint(&self, writer, flag, y);
+                            try self.writeCell(tag, emit, writer, cell);
+                            try replay.afterReprint(&self, writer, flag, y);
+                            reprint = null;
+                        }
 
                         // If we have a point map, all codepoints map to this
                         // cell.
@@ -7928,13 +7990,24 @@ test "Page VT unwrap sets a single column's flags right without moving" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    // A prompt flag taken off at the first column with a wrap pending.
-    var t = try Terminal.init(io, alloc, .{ .cols = 1, .rows = 4 });
-    defer t.deinit(alloc);
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("\x1b]133;P;k=i\x07a\x1b]133;C\x07b");
-    try expectVtUnwrapReplayForTest(&t, true);
+    const inputs = [_][]const u8{
+        // A prompt flag taken off at the first column with a wrap pending.
+        "\x1b]133;P;k=i\x07a\x1b]133;C\x07b",
+        // The same, the prompt going on into the row below: its column
+        // prints as output first, and again as the prompt.
+        "\x1b]133;P;k=i\x07ab\x1b[1;1H\x1b]133;C\x07",
+    };
+    for (inputs) |input| {
+        var t = try Terminal.init(io, alloc, .{ .cols = 1, .rows = 4 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(input);
+        expectVtUnwrapReplayForTest(&t, true) catch |err| {
+            std.debug.print("input {s}\n", .{input});
+            return err;
+        };
+    }
 }
 
 test "Page VT unwrap ends a wrapped row with a newline where a wrap would not bring the next back" {
@@ -7942,13 +8015,12 @@ test "Page VT unwrap ends a wrapped row with a newline where a wrap would not br
     const alloc = testing.allocator;
     const io = testing.io;
 
-    // A row's first column fills it, so the wrap is still pending after
-    // it and the cursor cannot go up to take the flag a prompt put on the
-    // row before off it: on a single column, and with a wide character on
-    // two.
+    // A wide character fills the row it wraps into on two columns, so the
+    // wrap is still pending after it and the cursor cannot go up to take
+    // the flag a prompt put on the row before off it; printing it again
+    // would take the spacer it left on the row before.
     const Case = struct { cols: size.CellCountInt, input: []const u8 };
     const cases = [_]Case{
-        .{ .cols = 1, .input = "\x1b]133;P;k=i\x07ab\x1b[1;1H\x1b]133;C\x07" },
         .{ .cols = 2, .input = "\x1b]133;P;k=i\x07a\u{4e2d}\x1b[1;1H\x1b]133;C\x07" },
     };
     for (cases) |case| {
