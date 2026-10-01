@@ -1301,6 +1301,7 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
             // case for scroll region usage.
             const cells = page.getCells(row);
             @memset(@as([]u64, @ptrCast(cells)), 0);
+            row.background = false;
         } else {
             // The generic clear handles managed memory and fills the
             // row with our blank cell, preserving the background color.

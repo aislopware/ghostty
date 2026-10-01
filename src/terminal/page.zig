@@ -1293,6 +1293,7 @@ pub const Page = struct {
         // Zero the cells as u64s since empirically this seems
         // to be a bit faster than using @memset(cells, .{})
         @memset(@as([]u64, @ptrCast(cells)), 0);
+        if (cells.len == self.size.cols) row.background = false;
     }
 
     /// Reset the given row to the default state: all cells zeroed and
@@ -2136,10 +2137,12 @@ pub const Row = packed struct(u64) {
     ///
     /// Asserts that the row has no managed memory: releasing that is
     /// the cell-clearing side's job and must happen while the flags
-    /// are still accurate.
+    /// are still accurate. The background flag describes the cells, so
+    /// it is the cell-clearing side's too, and is kept: a fill with a
+    /// background-coloured blank sets it whichever runs first.
     pub inline fn reset(self: *Row) void {
         assert(!self.managedMemory());
-        self.* = .{ .cells = self.cells, .dirty = true };
+        self.* = .{ .cells = self.cells, .dirty = true, .background = self.background };
     }
 };
 
