@@ -1050,6 +1050,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
             const cell_current: [*]pagepkg.Cell = @ptrCast(self.cursor.page_cell);
             const cells = cell_current - self.cursor.x;
             @memset(cells[0..self.pages.cols], blank_cell);
+            self.cursor.page_row.background = true;
         }
     }
 }
@@ -1150,6 +1151,7 @@ pub fn cursorScrollAbove(self: *Screen) !void {
             const cell_current: [*]pagepkg.Cell = @ptrCast(self.cursor.page_cell);
             const cells = cell_current - self.cursor.x;
             @memset(cells[0..self.pages.cols], blank_cell);
+            self.cursor.page_row.background = true;
         }
     }
 }
@@ -1401,6 +1403,7 @@ fn cursorScrollRegionUpSlow(self: *Screen, limit: usize) !void {
     if (!blank.isZero()) {
         const cells: [*]Cell = @ptrCast(self.cursor.page_cell);
         @memset((cells - self.cursor.x)[0..self.pages.cols], blank);
+        self.cursor.page_row.background = true;
     }
 }
 
@@ -1829,7 +1832,13 @@ pub fn clearCells(
         }
     }
 
-    @memset(cells, self.blankCell());
+    const blank = self.blankCell();
+    @memset(cells, blank);
+    if (blank.isBackground()) {
+        row.background = true;
+    } else if (cells.len == page.size.cols) {
+        row.background = false;
+    }
 }
 
 /// Clear cells but only if they are not protected.
