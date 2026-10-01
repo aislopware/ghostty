@@ -515,6 +515,7 @@ pub const TerminalFormatter = struct {
         var screen_formatter: ScreenFormatter = .init(self.terminal.screens.active, self.opts);
         screen_formatter.content = self.content;
         screen_formatter.pin_map = self.pin_map;
+        screen_formatter.terminal = self.terminal;
         try screen_formatter.format(writer);
 
         // Extra terminal state to emit after the screen contents so that
@@ -611,6 +612,14 @@ pub const ScreenFormatter = struct {
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
 
+    /// The terminal the screen belongs to, when it is known. The cursor
+    /// extra needs it for the state the terminal rather than the screen
+    /// keeps: the margins origin mode addresses the cursor within, and the
+    /// cursor's shape and blink. Without it, the cursor is addressed from
+    /// the top left of the screen and neither its shape nor its saved state
+    /// is emitted.
+    terminal: ?*const Terminal = null,
+
     pub const Content = union(enum) {
         /// Emit no content, only terminal state such as modes, palette, etc.
         /// via extra.
@@ -622,7 +631,11 @@ pub const ScreenFormatter = struct {
     };
 
     pub const Extra = packed struct {
-        /// Emit cursor position using CUP (CSI H).
+        /// Emit cursor position using CUP (CSI H). With the terminal known
+        /// (`ScreenFormatter.terminal`), also the cursor's shape (DECSCUSR)
+        /// when a program set it, and the state DECSC saved (position, pen,
+        /// protection, origin mode and character sets), saved again with
+        /// DECSC.
         cursor: bool,
 
         /// Emit current SGR style state based on the cursor's active style_id.
@@ -637,7 +650,8 @@ pub const ScreenFormatter = struct {
         /// Emit character protection mode using DECSCA.
         protection: bool,
 
-        /// Emit Kitty keyboard protocol state using CSI > u and CSI = sequences.
+        /// Emit the Kitty keyboard protocol flag stack using CSI = u and CSI > u
+        /// sequences, so that a pop after a replay gives back what it did.
         kitty_keyboard: bool,
 
         /// Emit character set designations and invocations.
@@ -731,37 +745,14 @@ pub const ScreenFormatter = struct {
         // pending wrap requires reprinting the cell at the right edge. That
         // print uses and changes active screen state, so the requested style,
         // hyperlink, protection, and charset must be restored afterwards.
-        if (self.extra.cursor) cursor: {
-            const cursor = &self.screen.cursor;
-
-            // If we don't have pending wrap, then we can just use CUP.
-            if (!cursor.pending_wrap or cursor.x != self.screen.pages.cols - 1) {
-                try writer.print("\x1b[{d};{d}H", .{ cursor.y + 1, cursor.x + 1 });
-                break :cursor;
+        if (self.extra.cursor) {
+            if (self.terminal) |t| {
+                try self.formatCursorShape(t, writer);
+                if (self.screen.saved_cursor) |saved| try self.formatSavedCursor(t, saved, writer);
             }
-
-            // Pending wrap, we can't use CUP because it resets pending wrap.
-            const start_x = switch (cursor.page_cell.wide) {
-                .spacer_tail => cursor.x - 1,
-                .narrow, .wide, .spacer_head => cursor.x,
-            };
-
-            // Move cursor to the edge.
-            try writer.print(
-                "\x1b[{d};{d}H",
-                .{ cursor.y + 1, start_x + 1 },
-            );
-
-            // Reformat the cell which sets the proper pending wrap state.
-            var cell_formatter: PageFormatter = .init(
-                cursor.page_pin.node.page(),
-                self.opts,
-            );
-            cell_formatter.start_x = cursor.x;
-            cell_formatter.end_x = cursor.x;
-            cell_formatter.start_y = cursor.page_pin.y;
-            cell_formatter.end_y = cursor.page_pin.y;
-            try cell_formatter.format(writer);
+            const cursor = &self.screen.cursor;
+            const origin = if (self.terminal) |t| t.modes.get(.origin) else false;
+            try self.formatCursorAt(writer, cursor.x, cursor.y, cursor.pending_wrap, origin);
         }
 
         // Emit current SGR style state
@@ -797,61 +788,30 @@ pub const ScreenFormatter = struct {
             }
         }
 
-        // Emit Kitty keyboard protocol state using CSI = u
+        // Emit Kitty keyboard protocol state: the whole stack, so that a pop
+        // after the replay gives back the flags it gave back before. The
+        // stack is a ring of entries; the oldest entry that is not disabled
+        // is set with CSI = u and each newer one pushed with CSI > u. A
+        // replay's ring is the same one rotated, which behaves the same.
         if (self.extra.kitty_keyboard) {
-            const current_flags = self.screen.kitty_keyboard.current();
-            if (current_flags.int() != kitty.KeyFlags.disabled.int()) {
-                const flags = current_flags.int();
-                try writer.print("\x1b[={d};1u", .{flags});
+            const stack = &self.screen.kitty_keyboard;
+            const len = stack.flags.len;
+            var started = false;
+            for (1..len + 1) |age| {
+                const at: u3 = @truncate(@as(usize, stack.idx) +% age);
+                const flags = stack.flags[at].int();
+                if (!started) {
+                    if (flags == kitty.KeyFlags.disabled.int()) continue;
+                    try writer.print("\x1b[={d};1u", .{flags});
+                    started = true;
+                } else {
+                    try writer.print("\x1b[>{d}u", .{flags});
+                }
             }
         }
 
         // Emit character set designations and invocations
-        if (self.extra.charsets) {
-            const charset = &self.screen.charset;
-
-            // Emit G0-G3 designations
-            for (std.enums.values(charsets.Slots)) |slot| {
-                const cs = charset.charsets.get(slot);
-                if (cs != .utf8) { // Only emit non-default charsets
-                    const intermediate: u8 = switch (slot) {
-                        .G0 => '(',
-                        .G1 => ')',
-                        .G2 => '*',
-                        .G3 => '+',
-                    };
-                    const final: u8 = switch (cs) {
-                        .ascii => 'B',
-                        .british => 'A',
-                        .dec_special => '0',
-                        else => continue,
-                    };
-                    try writer.print("\x1b{c}{c}", .{ intermediate, final });
-                }
-            }
-
-            // Emit GL invocation if not G0
-            if (charset.gl != .G0) {
-                const seq = switch (charset.gl) {
-                    .G0 => unreachable,
-                    .G1 => "\x0e", // SO - Shift Out
-                    .G2 => "\x1bn", // LS2
-                    .G3 => "\x1bo", // LS3
-                };
-                try writer.print("{s}", .{seq});
-            }
-
-            // Emit GR invocation if not G2
-            if (charset.gr != .G2) {
-                const seq = switch (charset.gr) {
-                    .G0 => unreachable, // GR can't be G0
-                    .G1 => "\x1b~", // LS1R
-                    .G2 => unreachable,
-                    .G3 => "\x1b|", // LS3R
-                };
-                try writer.print("{s}", .{seq});
-            }
-        }
+        if (self.extra.charsets) try formatCharsets(writer, self.screen.charset);
 
         // If we have a pin_map, we need to count how many bytes the extras
         // will emit so we can map them all to the same pin. We do this by
@@ -871,6 +831,174 @@ pub const ScreenFormatter = struct {
                     self.screen.pages.getTopLeft(.screen),
                 std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
             ) catch return error.WriteFailed;
+        }
+    }
+
+    /// Move the cursor to (`x`, `y`) on the screen, with a pending wrap
+    /// when `pending_wrap` (which only counts at the right edge). Under
+    /// origin mode (`origin`, with the terminal known) CUP counts from the
+    /// margins, so the position is given relative to them.
+    fn formatCursorAt(
+        self: ScreenFormatter,
+        writer: *std.Io.Writer,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+        pending_wrap: bool,
+        origin_mode: bool,
+    ) std.Io.Writer.Error!void {
+        const origin: struct { x: size.CellCountInt, y: size.CellCountInt } = if (self.terminal) |t|
+            if (origin_mode)
+                .{ .x = t.scrolling_region.left, .y = t.scrolling_region.top }
+            else
+                .{ .x = 0, .y = 0 }
+        else
+            .{ .x = 0, .y = 0 };
+
+        // If we don't have pending wrap, then we can just use CUP.
+        if (!pending_wrap or x != self.screen.pages.cols - 1) {
+            try writer.print("\x1b[{d};{d}H", .{ y -| origin.y + 1, x -| origin.x + 1 });
+            return;
+        }
+
+        // Pending wrap, we can't use CUP because it resets pending wrap.
+        const pin = self.screen.pages.pin(.{ .active = .{ .x = x, .y = y } }) orelse {
+            try writer.print("\x1b[{d};{d}H", .{ y -| origin.y + 1, x -| origin.x + 1 });
+            return;
+        };
+        const start_x = switch (pin.rowAndCell().cell.wide) {
+            .spacer_tail => x - 1,
+            .narrow, .wide, .spacer_head => x,
+        };
+
+        // Move cursor to the edge.
+        try writer.print(
+            "\x1b[{d};{d}H",
+            .{ y -| origin.y + 1, start_x -| origin.x + 1 },
+        );
+
+        // Reformat the cell which sets the proper pending wrap state.
+        var cell_formatter: PageFormatter = .init(pin.node.page(), self.opts);
+        cell_formatter.start_x = x;
+        cell_formatter.end_x = x;
+        cell_formatter.start_y = pin.y;
+        cell_formatter.end_y = pin.y;
+        try cell_formatter.format(writer);
+    }
+
+    /// The cursor's shape and blink as DECSCUSR, when a program chose them
+    /// rather than leaving the defaults. DECSCUSR also sets mode 12 (cursor
+    /// blinking), here to what it already is.
+    fn formatCursorShape(
+        self: ScreenFormatter,
+        t: *const Terminal,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        if (t.cursor.is_default) return;
+        const blinking: u8 = switch (self.screen.cursor.cursor_style) {
+            .block, .block_hollow => 1,
+            .underline => 3,
+            .bar => 5,
+        };
+        const steady: u8 = @intFromBool(!t.modes.get(.cursor_blinking));
+        try writer.print("\x1b[{d} q", .{blinking + steady});
+    }
+
+    /// The state DECSC saved, saved again with DECSC: the position (with a
+    /// pending wrap), the pen, the protection, origin mode and the character
+    /// sets. Each is then given back to what it is, for the extras after
+    /// this to set the cursor's own state from.
+    fn formatSavedCursor(
+        self: ScreenFormatter,
+        t: *const Terminal,
+        saved: Screen.SavedCursor,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const origin = t.modes.get(.origin);
+        const origin_set: []const u8 = if (saved.origin) "\x1b[?6h" else "\x1b[?6l";
+        if (saved.origin != origin) try writer.writeAll(origin_set);
+        // DECRC puts the cursor back by its screen position whatever the
+        // margins, and DECSC under origin mode saves a position within them.
+        try self.formatCursorAt(
+            writer,
+            @min(saved.x, self.screen.pages.cols - 1),
+            @min(saved.y, self.screen.pages.rows - 1),
+            saved.pending_wrap,
+            saved.origin,
+        );
+        try writer.print("{f}", .{saved.style.formatterVt()});
+        if (saved.protected) try writer.writeAll("\x1b[1\"q");
+        try formatCharsets(writer, saved.charset);
+        try writer.writeAll("\x1b7");
+
+        // No sequence designates UTF-8 into a slot again, so a slot the save
+        // designated and the terminal holds at UTF-8 now gets ASCII, which
+        // prints the same. A slot designated now is designated again by the
+        // charsets extra.
+        for (std.enums.values(charsets.Slots)) |slot| {
+            if (saved.charset.charsets.get(slot) == .utf8) continue;
+            if (self.screen.charset.charsets.get(slot) != .utf8) continue;
+            try writer.writeAll(switch (slot) {
+                .G0 => "\x1b(B",
+                .G1 => "\x1b)B",
+                .G2 => "\x1b*B",
+                .G3 => "\x1b+B",
+            });
+        }
+
+        try writer.writeAll("\x1b[0m");
+        if (saved.protected) try writer.writeAll("\x1b[0\"q");
+        if (saved.charset.gl != .G0) try writer.writeAll("\x0f");
+        if (saved.charset.gr != .G2) try writer.writeAll("\x1b}");
+        const origin_back: []const u8 = if (origin) "\x1b[?6h" else "\x1b[?6l";
+        if (saved.origin != origin) try writer.writeAll(origin_back);
+    }
+
+    /// Emit a character set state's designations and invocations that
+    /// differ from a fresh terminal's.
+    fn formatCharsets(
+        writer: *std.Io.Writer,
+        charset: Screen.CharsetState,
+    ) std.Io.Writer.Error!void {
+        // Emit G0-G3 designations
+        for (std.enums.values(charsets.Slots)) |slot| {
+            const cs = charset.charsets.get(slot);
+            if (cs != .utf8) { // Only emit non-default charsets
+                const intermediate: u8 = switch (slot) {
+                    .G0 => '(',
+                    .G1 => ')',
+                    .G2 => '*',
+                    .G3 => '+',
+                };
+                const final: u8 = switch (cs) {
+                    .ascii => 'B',
+                    .british => 'A',
+                    .dec_special => '0',
+                    else => continue,
+                };
+                try writer.print("\x1b{c}{c}", .{ intermediate, final });
+            }
+        }
+
+        // Emit GL invocation if not G0
+        if (charset.gl != .G0) {
+            const seq = switch (charset.gl) {
+                .G0 => unreachable,
+                .G1 => "\x0e", // SO - Shift Out
+                .G2 => "\x1bn", // LS2
+                .G3 => "\x1bo", // LS3
+            };
+            try writer.print("{s}", .{seq});
+        }
+
+        // Emit GR invocation if not G2
+        if (charset.gr != .G2) {
+            const seq = switch (charset.gr) {
+                .G0 => unreachable, // GR can't be G0
+                .G1 => "\x1b~", // LS1R
+                .G2 => unreachable,
+                .G3 => "\x1b|", // LS3R
+            };
+            try writer.print("{s}", .{seq});
         }
     }
 };
@@ -1580,6 +1708,10 @@ pub const PageFormatter = struct {
         var style: Style = .{};
         var style_id: u32 = 0;
 
+        // Whether the cells written since the last DECSCA are protected
+        // (VT only): selective erase skips them, so a replay must too.
+        var protected = false;
+
         // Whether the codepoint map has any entries. Hoisted out of the
         // per-codepoint path so that the common no-map case can use the
         // fast cell run path below.
@@ -1660,7 +1792,7 @@ pub const PageFormatter = struct {
                         // The replay wraps into this row on a blank written
                         // after the rest of the row before: unstyled, outside
                         // any hyperlink, and output.
-                        try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                        try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id, &protected);
                         try self.writeCarriedBlanks(writer, &replay, semantic, blank_cells, y);
                         if (semantic) try replay.wrap(&self, writer, p, .output, cols, y -| 1);
                         try writer.writeByte(' ');
@@ -1672,7 +1804,7 @@ pub const PageFormatter = struct {
                         replay = .{};
                         blank_cells = 0;
                     } else {
-                        try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                        try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id, &protected);
                         if (semantic) try replay.endRow(
                             &self,
                             writer,
@@ -1708,7 +1840,7 @@ pub const PageFormatter = struct {
                     .{ .fix = .{}, .wrapped = .none, .input_eol = false };
                 if (plan) |p| {
                     if (blank_cells > 0) {
-                        try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                        try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id, &protected);
                         try self.writeCarriedBlanks(writer, &replay, semantic, blank_cells, y);
                         blank_cells = 0;
                     }
@@ -1720,7 +1852,7 @@ pub const PageFormatter = struct {
                     reprint = p.reprint;
                     filled = self.cellStyle(first).bg_color != .none;
                 } else {
-                    try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                    try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id, &protected);
                     if (semantic) try replay.endRow(
                         &self,
                         writer,
@@ -1837,6 +1969,7 @@ pub const PageFormatter = struct {
                         y,
                         style_id,
                         current_hyperlink_id,
+                        protected,
                         if (semantic) replay.content else null,
                         &blank_cells,
                     );
@@ -1901,6 +2034,10 @@ pub const PageFormatter = struct {
                             style_id = 0;
                         }
                     }
+                    if (comptime emit == .vt) if (protected) {
+                        try self.formatProtectionOff(writer);
+                        protected = false;
+                    };
                     // Blank cells hold output.
                     if (semantic) try replay.content_to(
                         &self,
@@ -1938,6 +2075,12 @@ pub const PageFormatter = struct {
 
                     blank_cells = 0;
                 }
+
+                if (comptime emit == .vt) if (cell.protected != protected) {
+                    @branchHint(.unlikely);
+                    try self.formatProtection(writer, cell.protected, x, y);
+                    protected = cell.protected;
+                };
 
                 style: {
                     // If we aren't emitting styled output then we don't
@@ -2136,11 +2279,11 @@ pub const PageFormatter = struct {
             }
 
             if (wrap_fix != null) {
-                try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id, &protected);
                 try self.enterUnwritten(writer, &replay, semantic, &wrap_fix, y);
             }
             if (filled and blank_cells > 0) {
-                try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id, &protected);
                 const erase = "\x1b[K";
                 try writer.writeAll(erase);
                 if (self.point_map) |*map| map.map.appendNTimes(
@@ -2170,6 +2313,9 @@ pub const PageFormatter = struct {
 
         // If the style is non-default, we need to close our style tag.
         if (!style.default()) try self.formatStyleClose(emit, writer);
+
+        // Leave protection off, as a fresh terminal has it.
+        if (comptime emit == .vt) if (protected) try self.formatProtectionOff(writer);
 
         // Close any open hyperlink.
         if (current_hyperlink_id != null) try self.formatHyperlinkClose(emit, writer);
@@ -2231,6 +2377,7 @@ pub const PageFormatter = struct {
         run_y: size.CellCountInt,
         run_style_id: u32,
         run_hyperlink_id: ?hyperlink.Id,
+        run_protected: bool,
         run_semantic: ?Cell.SemanticContent,
         blank_cells: *usize,
     ) std.Io.Writer.Error!usize {
@@ -2243,6 +2390,18 @@ pub const PageFormatter = struct {
         var buf: [512]u8 = undefined;
         var len: usize = 0;
         var pending: usize = blank_cells.*;
+
+        // A cell stays in the run while its style (styled formats) and its
+        // protection (VT) are the run's: one masked compare of the packed
+        // cell, so the protection check costs nothing over the style's.
+        const Bits = @typeInfo(Cell).@"struct".backing_integer.?;
+        const style_shift = @bitOffsetOf(Cell, "style_id");
+        const protected_bit: Bits = @as(Bits, 1) << @bitOffsetOf(Cell, "protected");
+        const StyleId = @FieldType(Cell, "style_id");
+        const run_mask: Bits = @as(Bits, std.math.maxInt(StyleId)) << style_shift |
+            (if (comptime emit == .vt) protected_bit else 0);
+        const run_bits: Bits = @as(Bits, @as(StyleId, @truncate(run_style_id))) << style_shift |
+            (if (emit == .vt and run_protected) protected_bit else 0);
 
         var i: usize = 0;
         while (i < cells.len) : (i += 1) {
@@ -2262,9 +2421,9 @@ pub const PageFormatter = struct {
                 .bg_color_palette, .bg_color_rgb => break,
             }
 
+            // Style or protection transition, take the slow path.
             if (comptime formatStyled(emit)) {
-                // Style transition, take the slow path.
-                if (cell.style_id != run_style_id) break;
+                if (@as(Bits, @bitCast(cell.*)) & run_mask != run_bits) break;
             }
 
             const cp: u21 = cell.content.codepoint.data;
@@ -2320,6 +2479,9 @@ pub const PageFormatter = struct {
             if (pending > 0) {
                 if (comptime formatStyled(emit)) {
                     if (run_style_id != 0 or run_hyperlink_id != null) break;
+                }
+                if (comptime emit == .vt) {
+                    if (run_protected) break;
                 }
                 if (run_semantic) |content| if (content != .output) break;
                 if (track_points) try self.appendBlankPoints(
@@ -2484,8 +2646,13 @@ pub const PageFormatter = struct {
         style: *Style,
         style_id: *u32,
         current_hyperlink_id: *?hyperlink.Id,
+        protected: *bool,
     ) std.Io.Writer.Error!void {
         if (comptime !formatStyled(emit)) return;
+        if (comptime emit == .vt) if (protected.*) {
+            try self.formatProtectionOff(writer);
+            protected.* = false;
+        };
         if (current_hyperlink_id.* != null) {
             try self.formatHyperlinkClose(emit, writer);
             current_hyperlink_id.* = null;
@@ -2806,6 +2973,56 @@ pub const PageFormatter = struct {
                 );
                 try writer.writeAll("\">");
             },
+        }
+    }
+
+    /// Protect the cells written next (DECSCA 1) or stop (DECSCA 0). Out of
+    /// line: few programs protect cells, and the cell loop stays as tight
+    /// as it was without it.
+    noinline fn formatProtection(
+        self: *const PageFormatter,
+        writer: *std.Io.Writer,
+        on: bool,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+    ) std.Io.Writer.Error!void {
+        if (on) try self.formatProtectionOn(writer, x, y) else try self.formatProtectionOff(writer);
+    }
+
+    /// Protect the cells written next (DECSCA 1), mapping its bytes to the
+    /// cell at (`x`, `y`).
+    fn formatProtectionOn(
+        self: PageFormatter,
+        writer: *std.Io.Writer,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+    ) std.Io.Writer.Error!void {
+        const str = "\x1b[1\"q";
+        try writer.writeAll(str);
+        if (self.point_map) |*m| m.map.appendNTimes(
+            m.alloc,
+            .{ .x = x, .y = y },
+            str.len,
+        ) catch return error.WriteFailed;
+    }
+
+    /// Stop protecting the cells written next (DECSCA 0).
+    fn formatProtectionOff(
+        self: PageFormatter,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const str = "\x1b[0\"q";
+        try writer.writeAll(str);
+        if (self.point_map) |*m| {
+            assert(m.map.items.len > 0);
+            m.map.ensureUnusedCapacity(
+                m.alloc,
+                str.len,
+            ) catch return error.WriteFailed;
+            m.map.appendNTimesAssumeCapacity(
+                m.map.items[m.map.items.len - 1],
+                str.len,
+            );
         }
     }
 
@@ -6023,6 +6240,190 @@ test "Terminal vt cursor preserves pending wrap" {
         .{ .screen = .{} },
     );
     defer alloc.free(target_contents);
+    try testing.expectEqualStrings(source_contents, target_contents);
+}
+
+/// Format `source` as VT with every extra, check that the pin map covers
+/// every byte, and replay the output into `target`.
+fn testReplayAll(source: *const Terminal, target: *Terminal) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: TerminalFormatter = .init(source, .vt);
+    formatter.extra = .all;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    try testing.expectEqual(builder.writer.buffered().len, pin_map.count());
+
+    var stream = target.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(builder.writer.buffered());
+}
+
+test "Terminal vt cursor keeps the shape a program set" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{ "\x1b[6 q", "\x1b[3 q", "\x1b[2 q\x1b[?12h", "" }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 2 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 2 });
+        defer target.deinit(alloc);
+        try testReplayAll(&source, &target);
+
+        try testing.expectEqual(source.cursor.is_default, target.cursor.is_default);
+        try testing.expectEqual(
+            source.screens.active.cursor.cursor_style,
+            target.screens.active.cursor.cursor_style,
+        );
+        try testing.expectEqual(
+            source.modes.get(.cursor_blinking),
+            target.modes.get(.cursor_blinking),
+        );
+    }
+}
+
+test "Terminal vt cursor counts from the margins in origin mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        "\x1b[2;5r\x1b[?6h\x1b[2;3H",
+        "\x1b[?69h\x1b[3;8s\x1b[2;5r\x1b[?6h\x1b[3;2H",
+        // A pending wrap at the right margin's edge of the screen.
+        "\x1b[2;5r\x1b[?6h\x1b[1;1H0123456789",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+        defer target.deinit(alloc);
+        try testReplayAll(&source, &target);
+
+        const want = &source.screens.active.cursor;
+        const got = &target.screens.active.cursor;
+        try testing.expect(target.modes.get(.origin));
+        try testing.expectEqual(want.x, got.x);
+        try testing.expectEqual(want.y, got.y);
+        try testing.expectEqual(want.pending_wrap, got.pending_wrap);
+    }
+}
+
+test "Terminal vt cursor saves what DECSC saved" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        // A position, a pen, protection and a character set, then all of
+        // them changed again.
+        "\x1b[3;4H\x1b[1;31m\x1b[1\"q\x1b)0\x0e\x1b7\x1b[0m\x1b[0\"q\x0f\x1b[H",
+        // A pending wrap under origin mode, then origin mode off.
+        "\x1b[2;3r\x1b[?6h\x1b[1;1Habcd\x1b7\x1b[?6l\x1b[H",
+        // A pen alone.
+        "\x1b[2;2H\x1b[4m\x1b7\x1b[0m",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 4 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+        try testing.expect(source.screens.active.saved_cursor != null);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 4 });
+        defer target.deinit(alloc);
+        try testReplayAll(&source, &target);
+
+        try testing.expect(std.meta.eql(
+            source.screens.active.saved_cursor,
+            target.screens.active.saved_cursor,
+        ));
+        // The live cursor is the one the source has, not the saved one.
+        const want = &source.screens.active.cursor;
+        const got = &target.screens.active.cursor;
+        try testing.expectEqual(want.x, got.x);
+        try testing.expectEqual(want.y, got.y);
+        try testing.expectEqual(want.protected, got.protected);
+        try testing.expect(want.style.eql(got.style));
+        try testing.expect(std.meta.eql(source.screens.active.charset, target.screens.active.charset));
+        try testing.expectEqual(source.modes.get(.origin), target.modes.get(.origin));
+    }
+}
+
+test "Terminal vt keeps the kitty keyboard stack" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        "\x1b[>1u\x1b[>3u",
+        "\x1b[=5;1u\x1b[>0u\x1b[>7u",
+        // More pushes than the stack holds: the oldest are evicted.
+        "\x1b[>1u\x1b[>2u\x1b[>3u\x1b[>4u\x1b[>5u\x1b[>6u\x1b[>7u\x1b[>8u\x1b[>9u",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 2 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 2 });
+        defer target.deinit(alloc);
+        try testReplayAll(&source, &target);
+
+        var target_stream = target.vtStream();
+        defer target_stream.deinit();
+        for (0..9) |_| {
+            try testing.expectEqual(
+                source.screens.active.kitty_keyboard.current().int(),
+                target.screens.active.kitty_keyboard.current().int(),
+            );
+            source_stream.nextSlice("\x1b[<u");
+            target_stream.nextSlice("\x1b[<u");
+        }
+    }
+}
+
+test "Terminal vt keeps the cells a program protected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var source = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 3 });
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("\x1b[1\"qab\x1b[0\"qcd\r\n\x1b[1;4m\x1b[1\"qef\x1b[0\"q  gh\x1b[0m");
+
+    var target = try Terminal.init(io, alloc, .{ .cols = 8, .rows = 3 });
+    defer target.deinit(alloc);
+    try testReplayAll(&source, &target);
+    try testing.expect(!target.screens.active.cursor.protected);
+
+    // Selective erase leaves the protected cells alone, in both.
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    source_stream.nextSlice("\x1b[?2J");
+    target_stream.nextSlice("\x1b[?2J");
+    const source_contents = try source.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(source_contents);
+    const target_contents = try target.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(target_contents);
+    try testing.expectEqualStrings("ab\nef", source_contents);
     try testing.expectEqualStrings(source_contents, target_contents);
 }
 
