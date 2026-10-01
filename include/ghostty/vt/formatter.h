@@ -119,9 +119,13 @@ typedef struct {
 
   /** For VT, emit every row's prompt flag and every cell's semantic
    *  content (OSC 133), so a replay into a fresh terminal restores them.
-   *  Rows with no text but a prompt flag are emitted too. No effect when
-   *  unwrap is set. */
+   *  Rows with no text but a prompt flag are emitted too. */
   bool semantic_prompt;
+
+  /** For VT, end with the blank rows after the last one with text, as
+   *  newlines, so a replay into a fresh terminal of the same size has
+   *  every row that was formatted. */
+  bool trailing_rows;
 } GhosttyFormatterTerminalOptions;
 
 /**

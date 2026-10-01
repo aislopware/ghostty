@@ -110,9 +110,15 @@ pub const Options = struct {
     /// For VT, emit the semantic prompt state (OSC 133) of every row and
     /// cell, so a replay into a fresh terminal gives each row its prompt
     /// flag and each cell its content type (prompt, input or output). Rows
-    /// with no text but a prompt flag are emitted too. Has no effect with
-    /// `unwrap`, where rows do not start on a line of their own.
+    /// with no text but a prompt flag are emitted too.
     semantic_prompt: bool = false,
+
+    /// For VT, end with the blank rows after the last one with text, as
+    /// newlines, where they are otherwise left out. A replay into a fresh
+    /// terminal of the same size then has every row that was formatted:
+    /// the history of a screen whose last rows are blank keeps its length,
+    /// and the rows below it stay where they are.
+    trailing_rows: bool = false,
 
     /// Set a background and foreground color to use for the "screen".
     /// For styled formats, this will emit the proper sequences or styles.
@@ -950,6 +956,17 @@ pub const PageListFormatter = struct {
 
             page_state = try formatter.formatWithState(writer);
         }
+
+        // The pending newlines include one after the last blank row, which
+        // would add a row.
+        const state = page_state orelse return;
+        if (self.opts.emit != .vt or !self.opts.trailing_rows or state.rows < 2) return;
+        for (1..state.rows) |_| try writer.writeAll("\r\n");
+        if (self.pin_map) |*m| m.map.append(
+            m.alloc,
+            m.map.getLastOrNull() orelse br,
+            (state.rows - 1) * 2,
+        ) catch return error.WriteFailed;
     }
 };
 
@@ -7477,6 +7494,46 @@ test "Page VT unwrap ends a wrapped row with a newline where a wrap would not br
             std.debug.print("input {s}\n", .{input});
             return err;
         };
+    }
+}
+
+test "Screen VT trailing rows keep a scrolled screen's history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    // Five rows of text, then the last two of the screen left blank.
+    s.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n\r\n");
+
+    for ([_]bool{ false, true }) |trailing| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: ScreenFormatter = .init(t.screens.active, .{
+            .emit = .vt,
+            .trailing_rows = trailing,
+        });
+        formatter.extra = .none;
+        try formatter.format(&builder.writer);
+
+        var t2 = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 3 });
+        defer t2.deinit(alloc);
+        var s2 = t2.vtStream();
+        defer s2.deinit();
+        s2.nextSlice(builder.writer.buffered());
+
+        const want = try t.plainString(alloc);
+        defer alloc.free(want);
+        const got = try t2.plainString(alloc);
+        defer alloc.free(got);
+        if (trailing) {
+            try testing.expectEqualStrings(want, got);
+        } else {
+            try testing.expect(!std.mem.eql(u8, want, got));
+        }
     }
 }
 
