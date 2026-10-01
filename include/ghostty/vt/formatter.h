@@ -42,7 +42,12 @@ typedef struct {
   /** Size of this struct in bytes. Must be set to sizeof(GhosttyFormatterScreenExtra). */
   size_t size;
 
-  /** Emit cursor position using CUP (CSI H). */
+  /**
+   * Emit cursor position using CUP (CSI H), relative to the margins under
+   * origin mode. From a terminal formatter, also the cursor's shape
+   * (DECSCUSR) when a program set one, and the state DECSC saved, saved
+   * again with DECSC.
+   */
   bool cursor;
 
   /** Emit current SGR style state based on the cursor's active style_id. */
@@ -54,7 +59,7 @@ typedef struct {
   /** Emit character protection mode using DECSCA. */
   bool protection;
 
-  /** Emit Kitty keyboard protocol state using CSI > u and CSI = sequences. */
+  /** Emit the Kitty keyboard protocol flag stack using CSI = u and CSI > u sequences. */
   bool kitty_keyboard;
 
   /** Emit character set designations and invocations. */
