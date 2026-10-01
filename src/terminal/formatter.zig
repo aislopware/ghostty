@@ -1704,6 +1704,11 @@ pub const PageFormatter = struct {
             // ended in, which the replay writes to reach its last column.
             // When the wrap would not bring this row back as it is, the row
             // before ends with a newline after all.
+            //
+            // The wrap happens as the row's first cell is printed, so a
+            // wrap that scrolls fills the new row with that cell's
+            // background, which the blanks the row ends in must not keep.
+            var filled = false;
             if (joined) |flag| {
                 const first = &cells_subset[0];
                 const first_content: Cell.SemanticContent =
@@ -1725,6 +1730,7 @@ pub const PageFormatter = struct {
                     if (semantic) try replay.wrap(&self, writer, p, first_content, cols, y -| 1);
                     wrap_fix = p.fix;
                     reprint = p.reprint;
+                    filled = self.cellStyle(first).bg_color != .none;
                 } else {
                     try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
                     try self.enterUnwritten(writer, &replay, semantic, &wrap_fix, y);
@@ -2140,6 +2146,17 @@ pub const PageFormatter = struct {
                     if (semantic) try replay.fixWrap(&self, writer, fix, x + width, y, cols);
                     wrap_fix = null;
                 }
+            }
+
+            if (filled and blank_cells > 0) {
+                try self.closeStyled(emit, writer, &style, &style_id, &current_hyperlink_id);
+                const erase = "\x1b[K";
+                try writer.writeAll(erase);
+                if (self.point_map) |*map| map.map.appendNTimes(
+                    map.alloc,
+                    .{ .x = @intCast(row_start_x + cells_subset.len -| blank_cells), .y = y },
+                    erase.len,
+                ) catch return error.WriteFailed;
             }
 
             // If we're not wrapped, we always add a newline so after
@@ -7893,6 +7910,41 @@ test "Page VT unwrap replays soft wraps" {
             std.debug.print("input {s}\n", .{input});
             return err;
         };
+    }
+}
+
+test "Page VT unwrap keeps the blanks a wrap that scrolls ends a row in" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The replay wraps into the last row on a coloured cell and scrolls,
+    // which fills the new row with the colour; the blanks after the cell
+    // have none.
+    var t = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("xy\r\n0123\x1b[41ma\x1b[0m\x1b[K");
+    try expectVtUnwrapReplayForTest(&t, true);
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var formatter: PageListFormatter = .init(&t.screens.active.pages, .{
+        .emit = .vt,
+        .unwrap = true,
+        .trim = false,
+        .semantic_prompt = true,
+    });
+    try formatter.format(&builder.writer);
+    var t2 = try Terminal.init(io, alloc, .{ .cols = t.cols, .rows = t.rows });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+    for (1..t.cols) |x| {
+        const at: point.Point = .{ .active = .{ .x = @intCast(x), .y = 1 } };
+        try testing.expectEqual(Cell.ContentTag.codepoint, t2.screens.active.pages.getCell(at).?.cell.content_tag);
     }
 }
 
