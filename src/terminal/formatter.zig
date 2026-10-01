@@ -1111,7 +1111,17 @@ pub const PageListFormatter = struct {
             assert(chunk.start < chunk.end);
             assert(chunk.end > 0);
 
-            var formatter: PageFormatter = .init(chunk.node.page(), self.opts);
+            // A compressed page of history is decoded into a buffer of
+            // its own and stays compressed: formatting the scrollback
+            // (a checkpoint of all of it) must not undo what compression
+            // freed. Without the memory for a buffer it is restored in
+            // place, as any other read would.
+            var preserved: ?@TypeOf(chunk.node.*).PreservedPage =
+                chunk.node.pagePreservingState(self.list.pool.alloc) catch null;
+            defer if (preserved) |*p| p.deinit();
+            const page: *const Page = if (preserved) |*p| p.page() else chunk.node.page();
+
+            var formatter: PageFormatter = .init(page, self.opts);
             formatter.start_y = chunk.start;
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
@@ -6457,6 +6467,44 @@ test "Terminal vt cursor keeps a pending wrap on a prompt row with its semantic 
             want.page_cell.semantic_content == .prompt) .output else want.page_cell.semantic_content;
         try testing.expectEqual(content, got.page_cell.semantic_content);
     }
+}
+
+test "Terminal vt formats compressed history without restoring it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 80, .rows = 4, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..5_000) |i| {
+        var buf: [64]u8 = undefined;
+        stream.nextSlice(try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d}\x1b[0m\r\n", .{ i % 8, i }));
+    }
+
+    const format = struct {
+        fn all(term: *Terminal, a: std.mem.Allocator) ![]u8 {
+            var builder: std.Io.Writer.Allocating = .init(a);
+            errdefer builder.deinit();
+            var formatter: TerminalFormatter = .init(term, .vt);
+            formatter.extra = .all;
+            try formatter.format(&builder.writer);
+            return builder.toOwnedSlice();
+        }
+    }.all;
+    const before = try format(&t, alloc);
+    defer alloc.free(before);
+
+    const pages = &t.screens.get(.primary).?.pages;
+    if (t.compress(.full) == .unsupported) return error.SkipZigTest;
+    const compressed = pages.memoryStats();
+    try testing.expect(compressed.compressed_pages > 0);
+
+    const after = try format(&t, alloc);
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+    try testing.expectEqual(compressed, pages.memoryStats());
 }
 
 test "Terminal vt cursor keeps a pending wrap at the right margin" {
