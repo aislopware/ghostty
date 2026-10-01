@@ -72,6 +72,9 @@ pub const TerminalOptions = extern struct {
     /// If null, the entire screen is formatted.
     selection: ?*const CSelection = null,
 
+    /// For VT, emit every row's and cell's semantic prompt state (OSC 133).
+    semantic_prompt: bool = false,
+
     /// C: GhosttyFormatterTerminalExtra
     pub const Extra = extern struct {
         size: usize = @sizeOf(Extra),
@@ -144,6 +147,7 @@ fn terminal_new_(
         .emit = opts.emit,
         .unwrap = opts.unwrap,
         .trim = opts.trim,
+        .semantic_prompt = opts.semantic_prompt,
     });
     formatter.extra = opts.extra.toZig();
 
