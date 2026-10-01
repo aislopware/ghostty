@@ -2063,8 +2063,10 @@ pub const Row = packed struct(u64) {
     /// consumers of the page are expected to clear it when they redraw.
     ///
     /// Dirty status is only ever meant to convey that one or more cells in
-    /// the row have changed visually. A cell which changes in a way that
-    /// doesn't affect the visual representation may not be marked as dirty.
+    /// the row have changed visually, or that the row's semantic prompt
+    /// flag changed, which a render state copies with the row. A cell
+    /// which changes in a way that doesn't affect the visual representation
+    /// may not be marked as dirty.
     ///
     /// Dirty tracking may have false positives but should never have false
     /// negatives. A false negative would result in a visual artifact on the

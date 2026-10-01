@@ -1708,16 +1708,15 @@ fn testCompareStates(
 
     // Row metadata that is allowed to be stale in an incremental
     // update. Dirty tracking only guarantees that VISUAL changes are
-    // flagged (see page.Row.dirty); these fields are non-visual
-    // metadata that the terminal may change without dirtying the row
-    // (e.g. Screen.cursorResetWrap clears wrap flags without a dirty
-    // mark). This staleness predates the chunked update
+    // flagged (see page.Row.dirty), and the prompt flag; these fields
+    // are non-visual metadata that the terminal may change without
+    // dirtying the row (e.g. Screen.cursorResetWrap clears wrap flags
+    // without a dirty mark). This staleness predates the chunked update
     // implementation; it is present in the row-iterator implementation
     // as well.
     const StaleOkMask = page.Mask(page.Row, &.{
         "wrap",
         "wrap_continuation",
-        "semantic_prompt",
         "dirty",
     }, 1);
 
