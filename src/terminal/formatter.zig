@@ -5,6 +5,7 @@ const lib = @import("lib.zig");
 const Allocator = std.mem.Allocator;
 const color = @import("color.zig");
 const size = @import("size.zig");
+const point = @import("point.zig");
 const charsets = @import("charsets.zig");
 const hyperlink = @import("hyperlink.zig");
 const kitty = @import("kitty.zig");
@@ -1361,6 +1362,21 @@ pub const PageFormatter = struct {
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
                 if (blank_cells > 0) {
+                    // Styled formats only count unstyled cells outside any
+                    // hyperlink as blank, so the spaces that stand in for
+                    // them must not take the style or the hyperlink of the
+                    // cell before them.
+                    if (comptime formatStyled(emit)) {
+                        if (current_hyperlink_id != null) {
+                            try self.formatHyperlinkClose(emit, writer);
+                            current_hyperlink_id = null;
+                        }
+                        if (!style.default()) {
+                            try self.formatStyleClose(emit, writer);
+                            style = .{};
+                            style_id = 0;
+                        }
+                    }
                     try writer.splatByteAll(' ', blank_cells);
 
                     if (self.point_map) |*map| try self.appendBlankPoints(
@@ -1456,10 +1472,8 @@ pub const PageFormatter = struct {
 
                 // Hyperlink state
                 hyperlink: {
-                    // We currently only emit hyperlinks for HTML. In the
-                    // future we can support emitting OSC 8 hyperlinks for
-                    // VT output as well.
-                    if (comptime emit != .html) break :hyperlink;
+                    // HTML emits hyperlinks as anchors, VT as OSC 8.
+                    if (comptime !formatStyled(emit)) break :hyperlink;
 
                     // Get the hyperlink ID. This ID is our internal ID,
                     // not necessarily the OSC8 ID.
@@ -1484,17 +1498,14 @@ pub const PageFormatter = struct {
                     current_hyperlink_id = link_id;
 
                     // Emit the opening hyperlink tag
-                    const uri = uri: {
-                        const link = self.page.hyperlink_set.get(
-                            self.page.memory,
-                            link_id,
-                        );
-                        break :uri link.uri.offset.ptr(self.page.memory)[0..link.uri.len];
-                    };
+                    const link = self.page.hyperlink_set.get(
+                        self.page.memory,
+                        link_id,
+                    );
                     try self.formatHyperlinkOpen(
                         emit,
                         writer,
-                        uri,
+                        link,
                     );
 
                     // If we have a point map, we map the hyperlink to
@@ -1504,7 +1515,7 @@ pub const PageFormatter = struct {
                         try self.formatHyperlinkOpen(
                             emit,
                             &discarding.writer,
-                            uri,
+                            link,
                         );
                         map.map.appendNTimes(
                             map.alloc,
@@ -1555,7 +1566,7 @@ pub const PageFormatter = struct {
         // If the style is non-default, we need to close our style tag.
         if (!style.default()) try self.formatStyleClose(emit, writer);
 
-        // Close any open hyperlink for HTML output
+        // Close any open hyperlink.
         if (current_hyperlink_id != null) try self.formatHyperlinkClose(emit, writer);
 
         // Close the monospace wrapper for HTML output
@@ -1679,7 +1690,7 @@ pub const PageFormatter = struct {
             // cell must belong to the currently open hyperlink (or none).
             // Transitions take the slow path. This is checked after blank
             // accounting because blank cells never touch hyperlink state.
-            if (comptime emit == .html) {
+            if (comptime formatStyled(emit)) {
                 if (cell.hyperlink) {
                     const run_id = run_hyperlink_id orelse break;
                     const cell_id = self.page.lookupHyperlink(cell) orelse break;
@@ -1691,7 +1702,12 @@ pub const PageFormatter = struct {
             const x: size.CellCountInt = @intCast(run_x + i);
 
             // This cell produces output: materialize accumulated blanks.
+            // Blanks are unstyled and outside any hyperlink, so under a
+            // style or a link the slow path closes them first.
             if (pending > 0) {
+                if (comptime formatStyled(emit)) {
+                    if (run_style_id != 0 or run_hyperlink_id != null) break;
+                }
                 if (track_points) try self.appendBlankPoints(
                     &self.point_map.?,
                     pending,
@@ -2077,10 +2093,22 @@ pub const PageFormatter = struct {
         self: PageFormatter,
         comptime emit: Format,
         writer: *std.Io.Writer,
-        uri: []const u8,
+        link: *const hyperlink.PageEntry,
     ) std.Io.Writer.Error!void {
+        const memory = self.page.memory;
+        const uri = link.uri.offset.ptr(memory)[0..link.uri.len];
         switch (emit) {
-            .plain, .vt => unreachable,
+            .plain => unreachable,
+
+            // An implicit id is the terminal's own, so the link is opened
+            // without one and the replaying terminal assigns its own.
+            .vt => switch (link.id) {
+                .explicit => |id| try writer.print(
+                    "\x1b]8;id={s};{s}\x1b\\",
+                    .{ id.offset.ptr(memory)[0..id.len], uri },
+                ),
+                .implicit => try writer.print("\x1b]8;;{s}\x1b\\", .{uri}),
+            },
 
             // layout since we're primarily using it as a CSS wrapper.
             .html => {
@@ -2102,7 +2130,8 @@ pub const PageFormatter = struct {
     ) std.Io.Writer.Error!void {
         const str: []const u8 = switch (emit) {
             .html => "</a>",
-            .plain, .vt => return,
+            .vt => "\x1b]8;;\x1b\\",
+            .plain => return,
         };
 
         try writer.writeAll(str);
@@ -6802,6 +6831,123 @@ test "Page VT background color on trailing blank cells" {
 
     // This should be true but currently fails due to the bug
     try testing.expect(has_red_bg_line1);
+}
+
+/// The terminal `input` leaves, formatted as VT and replayed into a fresh
+/// terminal of the same size, for the tests that compare the two.
+fn vtReplayForTest(
+    alloc: Allocator,
+    io: std.Io,
+    t: *Terminal,
+    trim: bool,
+) !Terminal {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    const page = t.screens.active.pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.opts.trim = trim;
+    try formatter.format(&builder.writer);
+    var t2 = try Terminal.init(io, alloc, .{ .cols = t.cols, .rows = t.rows });
+    errdefer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+    return t2;
+}
+
+/// The URI of the hyperlink on the cell at `x`, `y` of `t`'s screen, if any.
+fn cellUriForTest(t: *const Terminal, x: size.CellCountInt, y: size.CellCountInt) ?[]const u8 {
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = x, .y = y } }).?;
+    const page = cell.node.page();
+    const id = page.lookupHyperlink(cell.cell) orelse return null;
+    return page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+}
+
+test "Page VT blank cells between styled cells replay unstyled" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // A tab leaves cells 1 to 7 never written, between two struck and
+    // overlined cells.
+    s.nextSlice("\x1b[9;53ma\tb\x1b[0m");
+
+    for ([_]bool{ true, false }) |trim| {
+        var t2 = try vtReplayForTest(alloc, io, &t, trim);
+        defer t2.deinit(alloc);
+        for (0..9) |x| {
+            const at: point.Point = .{ .screen = .{ .x = @intCast(x), .y = 0 } };
+            const want = t.screens.active.pages.getCell(at).?.style();
+            const got = t2.screens.active.pages.getCell(at).?.style();
+            try testing.expect(want.eql(got));
+        }
+        const blank = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 3, .y = 0 } }).?;
+        try testing.expect(blank.style().default());
+    }
+}
+
+test "Page VT blank cells after a styled run are not styled" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Long enough runs that the fast path writes them.
+    s.nextSlice("\x1b[7mreverse\x1b[1;12Hreverse\x1b[0m");
+
+    const page = t.screens.active.pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+    try formatter.format(&builder.writer);
+
+    // The style closes before the spaces and opens again after them.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        builder.writer.buffered(),
+        "reverse\x1b[0m    \x1b[0m\x1b[7mreverse",
+    ) != null);
+}
+
+test "Page VT hyperlinks replay as OSC 8" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("see \x1b]8;id=doc;https://example.com/a\x1b\\docs\x1b]8;;\x1b\\ ");
+    s.nextSlice("\x1b]8;;https://example.com/b\x1b\\b\x1b]8;;\x1b\\\x1b[1;20H");
+    s.nextSlice("\x1b[1m\x1b]8;;https://example.com/c\x1b\\bold\x1b]8;;\x1b\\\x1b[0m");
+
+    var t2 = try vtReplayForTest(alloc, io, &t, true);
+    defer t2.deinit(alloc);
+    for (0..30) |x| {
+        const want = cellUriForTest(&t, @intCast(x), 0);
+        const got = cellUriForTest(&t2, @intCast(x), 0);
+        if (want) |w| {
+            try testing.expectEqualStrings(w, got orelse return error.TestUnexpectedResult);
+        } else try testing.expect(got == null);
+    }
+
+    // The explicit id comes back with the link.
+    const cell = t2.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+    const page = cell.node.page();
+    const link = page.hyperlink_set.get(page.memory, page.lookupHyperlink(cell.cell).?);
+    try testing.expectEqualStrings("doc", link.id.explicit.slice(page.memory));
 }
 
 test "Page HTML with hyperlinks" {
