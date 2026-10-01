@@ -366,6 +366,32 @@ pub const TerminalFormatter = struct {
         };
     }
 
+    /// Emit the modes that differ from their defaults, in two passes around
+    /// the screen contents. Wraparound and insert change where printed text
+    /// lands, so with contents they come after them: a replay then writes the
+    /// contents as a fresh terminal does, wrapping soft-wrapped rows itself
+    /// (see `Options.unwrap`) and overwriting rather than inserting.
+    fn formatModes(
+        self: TerminalFormatter,
+        writer: *std.Io.Writer,
+        comptime pass: enum { before, after },
+    ) std.Io.Writer.Error!void {
+        inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
+            const mode: modespkg.Mode = @enumFromInt(field.value);
+            const after = self.content != .none and
+                (mode == .wraparound or mode == .insert);
+            const current = self.terminal.modes.get(mode);
+            const default_val = @field(self.terminal.modes.default, field.name);
+
+            if (after == (pass == .after) and current != default_val) {
+                const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
+                const prefix = if (tag.ansi) "" else "?";
+                const suffix = if (current) "h" else "l";
+                try writer.print("\x1b[{s}{d}{s}", .{ prefix, tag.value, suffix });
+            }
+        }
+    }
+
     pub fn format(
         self: TerminalFormatter,
         writer: *std.Io.Writer,
@@ -419,33 +445,16 @@ pub const TerminalFormatter = struct {
             }
         }
 
-        // Emit terminal modes that differ from defaults. We probably have
-        // some modes we want to emit before and some after, but for now for
-        // simplicity we just emit them all before. If we make this more complex
-        // later we should add test cases for it.
+        // Emit terminal modes that differ from defaults, before the screen
+        // contents but for those that change how the contents land (see
+        // `formatModes`), which follow them.
         if (self.opts.emit == .vt and self.extra.modes) {
-            inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
-                const mode: modespkg.Mode = @enumFromInt(field.value);
-                const current = self.terminal.modes.get(mode);
-                const default_val = @field(self.terminal.modes.default, field.name);
-
-                if (current != default_val) {
-                    const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
-                    const prefix = if (tag.ansi) "" else "?";
-                    const suffix = if (current) "h" else "l";
-                    try writer.print("\x1b[{s}{d}{s}", .{ prefix, tag.value, suffix });
-                }
-            }
+            try self.formatModes(writer, .before);
 
             // If we have a pin_map, add the bytes we wrote to map.
             if (self.pin_map) |*m| {
                 var discarding: std.Io.Writer.Discarding = .init(&.{});
-                var extra_formatter: TerminalFormatter = self;
-                extra_formatter.content = .none;
-                extra_formatter.pin_map = null;
-                extra_formatter.extra = .none;
-                extra_formatter.extra.modes = true;
-                try extra_formatter.format(&discarding.writer);
+                try self.formatModes(&discarding.writer, .before);
 
                 // Map all those bytes to the same pin. Use the top left to ensure
                 // the node pointer is always properly initialized.
@@ -505,6 +514,8 @@ pub const TerminalFormatter = struct {
         // Extra terminal state to emit after the screen contents so that
         // it doesn't impact the emitted contents.
         if (self.opts.emit == .vt) {
+            if (self.extra.modes) try self.formatModes(writer, .after);
+
             // Emit scrolling region using DECSTBM and DECSLRM
             if (self.extra.scrolling_region) {
                 const region = &self.terminal.scrolling_region;
@@ -539,6 +550,7 @@ pub const TerminalFormatter = struct {
             // If we have a pin_map, add the bytes we wrote to map.
             if (self.pin_map) |*m| {
                 var discarding: std.Io.Writer.Discarding = .init(&.{});
+                if (self.extra.modes) try self.formatModes(&discarding.writer, .after);
                 var extra_formatter: TerminalFormatter = self;
                 extra_formatter.content = .none;
                 extra_formatter.pin_map = null;
@@ -5980,6 +5992,39 @@ test "Terminal vt with modes" {
     try testing.expectEqual(t.modes.get(.bracketed_paste), t2.modes.get(.bracketed_paste));
     try testing.expectEqual(t.modes.get(.mouse_event_normal), t2.modes.get(.mouse_event_normal));
     try testing.expectEqual(t.modes.get(.wraparound), t2.modes.get(.wraparound));
+}
+
+test "Terminal vt with unwrap replays soft wraps with wraparound off and insert on" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("0123456789abc\r\nnext\x1b[?7l\x1b[4h");
+
+    var formatter: TerminalFormatter = .init(&t, .{ .emit = .vt, .unwrap = true });
+    formatter.extra.modes = true;
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 4 });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    const str = try t2.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("0123456789\nabc\nnext", str);
+    const row: point.Point = .{ .screen = .{ .x = 0, .y = 0 } };
+    try testing.expect(t2.screens.active.pages.getCell(row).?.row.wrap);
+    try testing.expectEqual(t.modes.get(.wraparound), t2.modes.get(.wraparound));
+    try testing.expectEqual(t.modes.get(.insert), t2.modes.get(.insert));
 }
 
 test "Terminal vt with tabstops" {
