@@ -89,6 +89,12 @@ pub const Options = struct {
 
     /// Whether to unwrap soft-wrapped lines. If false, this will emit the
     /// screen contents as it is rendered on the page in the given size.
+    ///
+    /// For VT, a soft-wrapped row then ends without a newline, so a
+    /// terminal of the same width replaying the output wraps it again
+    /// itself. Where that would not bring the next row back as it is (that
+    /// row has no text, or its semantic prompt state differs from what the
+    /// wrap gives it), the row ends with a newline after all.
     unwrap: bool = false,
 
     /// Trim trailing whitespace on lines with other text. Trailing blank
@@ -950,6 +956,12 @@ const SemanticReplay = struct {
     content: Cell.SemanticContent = .output,
     row: Row.SemanticPrompt = .none,
 
+    /// The input content ends at the end of the line (`I`, not `B`).
+    eol: bool = false,
+
+    /// How input content is started: with `I` rather than `B`.
+    input_eol: bool = false,
+
     fn emit(
         fmt: *const PageFormatter,
         writer: *std.Io.Writer,
@@ -976,6 +988,7 @@ const SemanticReplay = struct {
     ) std.Io.Writer.Error!void {
         try emit(fmt, writer, "\x1b]133;P;k=" ++ kind ++ "\x1b\\", x, y);
         self.content = .prompt;
+        self.eol = false;
         self.row = if (comptime std.mem.eql(u8, kind, "i")) .prompt else .prompt_continuation;
     }
 
@@ -988,7 +1001,7 @@ const SemanticReplay = struct {
         x: size.CellCountInt,
         y: size.CellCountInt,
     ) std.Io.Writer.Error!void {
-        if (self.content == want) return;
+        if (self.content == want and (want != .input or self.eol == self.input_eol)) return;
         switch (want) {
             // Prompt content on an unflagged row flags it; `endRow`
             // takes the flag off again.
@@ -997,8 +1010,10 @@ const SemanticReplay = struct {
                 .prompt, .none => try self.prompt(fmt, writer, "i", x, y),
             },
             .input => {
-                try emit(fmt, writer, "\x1b]133;B\x1b\\", x, y);
+                const seq = if (self.input_eol) "\x1b]133;I\x1b\\" else "\x1b]133;B\x1b\\";
+                try emit(fmt, writer, seq, x, y);
                 self.content = .input;
+                self.eol = self.input_eol;
             },
             .output => {
                 const seq = if (x == 0 and self.row != .none)
@@ -1007,6 +1022,30 @@ const SemanticReplay = struct {
                     "\x1b]133;C\x1b\\";
                 try emit(fmt, writer, seq, x, y);
                 self.content = .output;
+                self.eol = false;
+            },
+        }
+    }
+
+    /// Whether the replay, wrapping into a row flagged `flag` whose first
+    /// cell holds `first`, brings it back as it is; and if so, how input on
+    /// it starts. The wrap keeps the content, and prompt content or input
+    /// that does not end at the end of the line flags the new row as a
+    /// continuation. Until the row's first cell prints, the cursor is still
+    /// on the row before, where only the content can change: no prompt can
+    /// start there, since that would flag the row before.
+    fn wrapsInto(
+        self: *SemanticReplay,
+        flag: Row.SemanticPrompt,
+        first: Cell.SemanticContent,
+    ) bool {
+        switch (first) {
+            .prompt => return self.content == .prompt and flag == .prompt_continuation,
+            .output => return flag == .none,
+            .input => {
+                if (flag == .prompt) return false;
+                self.input_eol = flag == .none;
+                return true;
             },
         }
     }
@@ -1101,6 +1140,13 @@ pub const PageFormatter = struct {
         rows: usize = 0,
         cells: usize = 0,
 
+        /// VT with unwrap: the last row was soft-wrapped and left without a
+        /// newline for the replay to wrap, with the prompt flag it has.
+        joined: ?Row.SemanticPrompt = null,
+
+        /// VT with the semantic prompt state: what the replay holds so far.
+        replay: SemanticReplay = .{},
+
         pub const empty: TrailingState = .{ .rows = 0, .cells = 0 };
     };
 
@@ -1145,6 +1191,10 @@ pub const PageFormatter = struct {
     ) std.Io.Writer.Error!TrailingState {
         var blank_rows: usize = 0;
         var blank_cells: usize = 0;
+        var joined: ?Row.SemanticPrompt = null;
+
+        // The semantic prompt state a VT replay holds so far.
+        var replay: SemanticReplay = .{};
 
         // Continue our prior trailing state if we have it, but only if we're
         // starting from the beginning (start_y and start_x are both 0).
@@ -1153,21 +1203,23 @@ pub const PageFormatter = struct {
             if (self.start_y == 0 and self.start_x == 0) {
                 blank_rows = state.rows;
                 blank_cells = state.cells;
+                joined = state.joined;
+                replay = state.replay;
             }
         }
 
         // Setup our starting column and perform some validation for overflows.
         // Note: start_x only applies to the first row, end_x only applies to the last row.
         const start_x: size.CellCountInt = self.start_x;
-        if (start_x >= self.page.size.cols) return .{ .rows = blank_rows, .cells = blank_cells };
+        if (start_x >= self.page.size.cols) return .{ .rows = blank_rows, .cells = blank_cells, .joined = joined, .replay = replay };
         const end_x_unclamped: size.CellCountInt = self.end_x orelse self.page.size.cols - 1;
         var end_x = @min(end_x_unclamped, self.page.size.cols - 1);
 
         // Setup our starting row and perform some validation for overflows.
         const start_y: size.CellCountInt = self.start_y;
-        if (start_y >= self.page.size.rows) return .{ .rows = blank_rows, .cells = blank_cells };
+        if (start_y >= self.page.size.rows) return .{ .rows = blank_rows, .cells = blank_cells, .joined = joined, .replay = replay };
         const end_y_unclamped: size.CellCountInt = self.end_y orelse self.page.size.rows - 1;
-        if (start_y > end_y_unclamped) return .{ .rows = blank_rows, .cells = blank_cells };
+        if (start_y > end_y_unclamped) return .{ .rows = blank_rows, .cells = blank_cells, .joined = joined, .replay = replay };
         var end_y = @min(end_y_unclamped, self.page.size.rows - 1);
 
         // Edge case: if our end x/y falls on a spacer head AND we're unwrapping,
@@ -1195,7 +1247,7 @@ pub const PageFormatter = struct {
 
         // If we only have a single row, validate that start_x <= end_x
         if (start_y == end_y and start_x > end_x) {
-            return .{ .rows = blank_rows, .cells = blank_cells };
+            return .{ .rows = blank_rows, .cells = blank_cells, .joined = joined, .replay = replay };
         }
 
         // Wrap HTML output in monospace font styling
@@ -1281,9 +1333,10 @@ pub const PageFormatter = struct {
         // when the hyperlink changes or ends.
         var current_hyperlink_id: ?hyperlink.Id = null;
 
-        // The semantic prompt state a VT replay holds so far.
-        const semantic = emit == .vt and self.opts.semantic_prompt and !self.opts.unwrap;
-        var replay: SemanticReplay = .{};
+        // Whether a VT replay's semantic prompt state is emitted, and whether
+        // a soft-wrapped row is left for the replay to wrap.
+        const semantic = emit == .vt and self.opts.semantic_prompt;
+        const vt_join = emit == .vt and self.opts.unwrap;
 
         for (start_y..end_y + 1) |y_usize| {
             const y: size.CellCountInt = @intCast(y_usize);
@@ -1329,8 +1382,58 @@ pub const PageFormatter = struct {
             if (!Cell.hasTextAny(cells_subset) and
                 !(semantic and row.semantic_prompt != .none))
             {
+                // A replay wraps only on the text that follows, so a row
+                // left to wrap into one with none ends with a newline.
+                if (joined) |flag| {
+                    if (semantic) try replay.endRow(
+                        &self,
+                        writer,
+                        flag,
+                        self.page.size.cols - 1,
+                        y -| 1,
+                    );
+                    joined = null;
+                    blank_rows += 1;
+                }
                 blank_rows += 1;
                 continue;
+            }
+
+            // A row the replay wraps into keeps the blanks the row before
+            // ended in, which the replay writes to reach its last column.
+            // When the wrap would not bring this row back as it is, the row
+            // before ends with a newline after all.
+            if (joined) |flag| {
+                const first = &cells_subset[0];
+                const first_content: Cell.SemanticContent =
+                    if (first.isEmpty() and !first.hasStyling()) .output else first.semantic_content;
+                if (!semantic or replay.wrapsInto(row.semantic_prompt, first_content)) {
+                    if (semantic) {
+                        replay.row = row.semantic_prompt;
+                        // With no blanks left to write on the row before,
+                        // the content the row starts with is set now, while
+                        // the cursor is still there: a run of cells in one
+                        // content writes no step of its own.
+                        if (blank_cells == 0) try replay.content_to(
+                            &self,
+                            writer,
+                            first_content,
+                            row_start_x,
+                            y,
+                        );
+                    }
+                } else {
+                    try replay.endRow(
+                        &self,
+                        writer,
+                        flag,
+                        self.page.size.cols - 1,
+                        y -| 1,
+                    );
+                    joined = null;
+                    blank_rows += 1;
+                    blank_cells = 0;
+                }
             }
 
             if (blank_rows > 0) {
@@ -1392,17 +1495,17 @@ pub const PageFormatter = struct {
                 blank_rows = 0;
             }
 
-            // If we're not wrapped, we always add a newline so after
-            // the row is printed we can add a newline.
-            if (!row.wrap or !self.opts.unwrap) blank_rows += 1;
-
             // If the row doesn't continue a wrap then we need to reset
-            // our blank cell count.
-            if (!row.wrap_continuation or !self.opts.unwrap) blank_cells = 0;
+            // our blank cell count. VT keeps them only on a row the replay
+            // wraps into.
+            if (vt_join) {
+                if (joined == null) blank_cells = 0;
+            } else if (!row.wrap_continuation or !self.opts.unwrap) blank_cells = 0;
 
             // The replay's cursor stands at the start of a row it has not
-            // flagged, with output content (see the end of the row below).
-            if (semantic) {
+            // flagged, with output content (see the end of the row below),
+            // unless it wrapped into this row.
+            if (semantic and joined == null) {
                 replay = .{};
                 switch (row.semantic_prompt) {
                     .none => {},
@@ -1505,7 +1608,7 @@ pub const PageFormatter = struct {
                         &self,
                         writer,
                         .output,
-                        @intCast(x - blank_cells),
+                        @intCast(@as(usize, x) -| blank_cells),
                         y,
                     );
                     try writer.splatByteAll(' ', blank_cells);
@@ -1701,13 +1804,24 @@ pub const PageFormatter = struct {
                 }
             }
 
-            if (semantic) try replay.endRow(
-                &self,
-                writer,
-                row.semantic_prompt,
-                @intCast(row_start_x + cells_subset.len -| 1),
-                y,
-            );
+            // If we're not wrapped, we always add a newline so after
+            // the row is printed we can add a newline. A VT replay wraps a
+            // row itself only when it holds the row's prompt flag already.
+            if (vt_join and row.wrap and
+                (!semantic or replay.row == row.semantic_prompt))
+            {
+                joined = row.semantic_prompt;
+            } else {
+                if (semantic) try replay.endRow(
+                    &self,
+                    writer,
+                    row.semantic_prompt,
+                    @intCast(row_start_x + cells_subset.len -| 1),
+                    y,
+                );
+                joined = null;
+                if (vt_join or !row.wrap or !self.opts.unwrap) blank_rows += 1;
+            }
         }
 
         // If the style is non-default, we need to close our style tag.
@@ -1735,7 +1849,7 @@ pub const PageFormatter = struct {
             if (blank_rows >= 1) blank_rows -= 1;
         }
 
-        return .{ .rows = blank_rows, .cells = blank_cells };
+        return .{ .rows = blank_rows, .cells = blank_cells, .joined = joined, .replay = replay };
     }
 
     /// Fast path for writing runs of simple cells: single-codepoint cells
@@ -7201,6 +7315,124 @@ test "Page VT point map covers closed blanks, hyperlinks and the semantic prompt
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]8;id=x;") != null);
     try testing.expect(std.mem.indexOf(u8, output, "133;") != null);
     try testing.expectEqual(output.len, point_map.items.len);
+}
+
+/// Formats `t`'s screen as VT with unwrap and the semantic prompt state,
+/// replays it into a fresh terminal of the same size, and checks every row's
+/// soft wrap (unless `wraps` is false) and prompt flag and every cell's text
+/// and semantic content.
+fn expectVtUnwrapReplayForTest(t: *Terminal, wraps: bool) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var formatter: PageListFormatter = .init(&t.screens.active.pages, .{
+        .emit = .vt,
+        .unwrap = true,
+        .trim = false,
+        .semantic_prompt = true,
+    });
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{ .cols = t.cols, .rows = t.rows });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    for (0..t.rows) |y| {
+        const row_at: point.Point = .{ .screen = .{ .x = 0, .y = @intCast(y) } };
+        const want = t.screens.active.pages.getCell(row_at).?.row;
+        const got = t2.screens.active.pages.getCell(row_at).?.row;
+        errdefer std.debug.print("row {d}: {f}\n", .{ y, std.ascii.hexEscape(builder.writer.buffered(), .lower) });
+        if (wraps) try testing.expectEqual(want.wrap, got.wrap);
+        try testing.expectEqual(want.semantic_prompt, got.semantic_prompt);
+        for (0..t.cols) |x| {
+            const at: point.Point = .{ .screen = .{ .x = @intCast(x), .y = @intCast(y) } };
+            const a = t.screens.active.pages.getCell(at).?.cell;
+            const b = t2.screens.active.pages.getCell(at).?.cell;
+            // A blank written as a space draws the same.
+            const text_a: u21 = if (a.codepoint() == ' ') 0 else a.codepoint();
+            const text_b: u21 = if (b.codepoint() == ' ') 0 else b.codepoint();
+            try testing.expectEqual(text_a, text_b);
+            try testing.expectEqual(a.wide, b.wide);
+            try testing.expectEqual(a.semantic_content, b.semantic_content);
+        }
+    }
+}
+
+test "Page VT unwrap replays soft wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const inputs = [_][]const u8{
+        // A row wrapped into the next, and a hard newline after it.
+        "0123456789abcde\r\nxy",
+        // A wide character that does not fit wraps whole.
+        "012345678\u{4e2d}x",
+        // A row that wraps into one with blanks before its text.
+        "0123456789\x1b[2;5Hz",
+        // A command line typed past the edge, and a prompt that wraps.
+        "\x1b]133;A\x07$ \x1b]133;B\x07echo 0123456789\r\n\x1b]133;C\x07out\r\n\x1b]133;A\x07prompt> 0123",
+        // Output that wraps on a prompt's row.
+        "\x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07 01234567",
+        // Input that ends at the end of the line, wrapped.
+        "\x1b]133;A\x07$ \x1b]133;I\x07typed past it\r\nout",
+    };
+    for (inputs) |input| {
+        var t = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 5 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(input);
+        expectVtUnwrapReplayForTest(&t, true) catch |err| {
+            std.debug.print("input {s}\n", .{input});
+            return err;
+        };
+    }
+}
+
+test "Page VT unwrap replays soft wraps after a resize reflowed them" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("0123456789abcdefghijklmn\r\nshort\r\n\x1b]133;C\x07a longer line of output");
+    try t.resize(alloc, .{ .cols = 8, .rows = 7 });
+    try expectVtUnwrapReplayForTest(&t, true);
+}
+
+test "Page VT unwrap ends a wrapped row with a newline where a wrap would not bring the next back" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const inputs = [_][]const u8{
+        // The row wrapped into was erased: nothing there to wrap on.
+        "0123456789ab\x1b[2;1H\x1b[2K\x1b[3;1Hz",
+        // The row a prompt wrapped into was flagged a prompt of its own.
+        "\x1b]133;A\x070123456789ab\x1b]133;P;k=i\x07c",
+        // The row output wrapped into starts with prompt content.
+        "0123456789\x1b]133;P;k=i\x07$",
+    };
+    for (inputs) |input| {
+        var t = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 5 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(input);
+        expectVtUnwrapReplayForTest(&t, false) catch |err| {
+            std.debug.print("input {s}\n", .{input});
+            return err;
+        };
+    }
 }
 
 test "Page VT semantic prompt state is left out unless asked for" {
