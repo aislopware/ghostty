@@ -1725,7 +1725,9 @@ pub fn clearRows(
                 row.cells = cells_offset;
             } else {
                 self.clearCells(page, row, cells);
-                row.* = .{ .cells = cells_offset };
+                // A blank under a coloured pen holds a background.
+                const background = row.background;
+                row.* = .{ .cells = cells_offset, .background = background };
             }
 
             row.dirty = true;

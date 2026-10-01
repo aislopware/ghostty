@@ -6026,6 +6026,9 @@ test "Terminal: a row holding a cell with only a background is flagged" {
         .{ .input = "ab\x1b[41m\x1b[K" },
         // A scroll under one.
         .{ .input = "\x1b[48;2;1;2;3m\r\n\r\n\r\n\r\n" },
+        // The whole screen erased under one, and the alternate screen too.
+        .{ .input = "x\x1b[41m\x1b[2J" },
+        .{ .input = "\x1b[?1049hx\x1b[41m\x1b[2J" },
         // Characters inserted and deleted around the colour.
         .{ .input = "\x1b[41m\x1b[2K\x1b[0m\x1b[3G\x1b[2@\x1b[2P" },
         // Reflowed narrower and wider.
