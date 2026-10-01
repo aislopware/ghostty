@@ -1529,6 +1529,8 @@ pub fn print(self: *Terminal, c: u21) !void {
             if (!emoji) return;
         }
 
+        // The cell attached to is on the cursor row.
+        self.screens.active.cursorMarkDirty();
         try self.screens.active.appendGrapheme(prev, c);
         return;
     }
@@ -5731,7 +5733,7 @@ test "Terminal: VS16 doesn't make character with 2027 disabled" {
     }
 }
 
-test "Terminal: ignored VS16 doesn't mark dirty" {
+test "Terminal: VS16 attached without clustering marks dirty" {
     var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
     defer t.deinit(testing.allocator);
 
@@ -5741,9 +5743,12 @@ test "Terminal: ignored VS16 doesn't mark dirty" {
     try t.print(0x2764); // Heart
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 
+    // The width stays, but the cell holds the selector now.
     t.clearDirty();
     try t.print(0xFE0F); // VS16 to make wide
-    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;
+    try testing.expect(cell.hasGrapheme());
 }
 
 test "Terminal: print invalid VS16 non-grapheme" {
@@ -5982,6 +5987,22 @@ test "Terminal: Fitzpatrick skin tone next to non-base" {
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
     }
+}
+
+test "Terminal: zero-width character attached without clustering marks dirty" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    try t.print('a');
+    t.clearDirty();
+    try t.print(0x0301);
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+
+    // With a wrap pending the cell is still under the cursor.
+    try t.printString("bcdefghij");
+    t.clearDirty();
+    try t.print(0x0301);
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 }
 
 test "Terminal: multicodepoint grapheme marks dirty on every codepoint" {
