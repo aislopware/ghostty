@@ -1267,6 +1267,14 @@ const SemanticReplay = struct {
     }
 };
 
+/// Whether a row's cells format as nothing: no text, and for styled formats
+/// no styling either (a background an erase left draws).
+fn blankRow(comptime emit: Format, cells: []const Cell) bool {
+    if (comptime !formatStyled(emit)) return !Cell.hasTextAny(cells);
+    for (cells) |cell| if (!cell.isEmpty() or cell.hasStyling()) return false;
+    return true;
+}
+
 /// The prompt flag a VT replay has given the row its cursor is on, with the
 /// flags a wrap into that row is still to set right set.
 fn rowBefore(replay: SemanticReplay, wrap_fix: ?SemanticReplay.WrapFix) Row.SemanticPrompt {
@@ -1595,7 +1603,7 @@ pub const PageFormatter = struct {
             // semantic prompt state is emitted.
             // A blank row the replay must wrap from is written like one with
             // text (as blanks), since a replay wraps only on what follows.
-            if (!Cell.hasTextAny(cells_subset) and
+            if (blankRow(emit, cells_subset) and
                 !(semantic and row.semantic_prompt != .none) and
                 !(vt_join and row.wrap))
             {
@@ -7756,6 +7764,42 @@ fn expectVtUnwrapReplayForTest(t: *Terminal, wraps: bool) !void {
             if (a.wide != .spacer_head) try testing.expectEqual(a.semantic_content, b.semantic_content);
         }
     }
+}
+
+test "Page VT keeps a row that only holds a background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // An erase under a coloured pen leaves cells with no text and no style
+    // of their own, only the colour.
+    var t = try Terminal.init(io, alloc, .{ .cols = 6, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[44m\x1b[K\x1b[0m\r\n\r\nz");
+
+    const vt = struct {
+        fn format(term: *Terminal) ![]const u8 {
+            var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+            errdefer builder.deinit();
+            var formatter: PageListFormatter = .init(&term.screens.active.pages, .{ .emit = .vt });
+            try formatter.format(&builder.writer);
+            return builder.toOwnedSlice();
+        }
+    };
+    const want = try vt.format(&t);
+    defer alloc.free(want);
+    try testing.expect(std.mem.indexOf(u8, want, "\x1b[48;5;4m      ") != null);
+
+    var t2 = try Terminal.init(io, alloc, .{ .cols = 6, .rows = 3 });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(want);
+    const got = try vt.format(&t2);
+    defer alloc.free(got);
+    try testing.expectEqualStrings(want, got);
 }
 
 test "Page VT unwrap replays soft wraps" {
