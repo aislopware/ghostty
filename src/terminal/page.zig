@@ -897,6 +897,7 @@ pub const Page = struct {
                 copy.grapheme = dst_row.grapheme;
                 copy.hyperlink = dst_row.hyperlink;
                 copy.styled = dst_row.styled;
+                copy.background = dst_row.background or src_row.background;
                 copy.dirty |= dst_row.dirty;
             }
 
@@ -1136,6 +1137,8 @@ pub const Page = struct {
             }
         }
 
+        if (src_row.background) dst_row.background = true;
+
         // The destination row has styles if any of the cells are styled
         if (!dst_row.styled) dst_row.styled = styled: for (dst_cells) |c| {
             if (c.style_id != stylepkg.default_id) break :styled true;
@@ -1152,6 +1155,7 @@ pub const Page = struct {
             src_row.grapheme = false;
             src_row.hyperlink = false;
             src_row.styled = false;
+            src_row.background = false;
             if (comptime build_options.kitty_graphics) {
                 src_row.kitty_virtual_placeholder = false;
             }
@@ -2058,6 +2062,13 @@ pub const Row = packed struct(u64) {
     // everything throughout the same.
     kitty_virtual_placeholder: bool = false,
 
+    /// True if any cell in this row holds only a background colour (what an
+    /// erase or a scroll under a coloured pen leaves). Such a cell has no
+    /// style, so `styled` does not say so, and a reader of the row's cells
+    /// looks for one only where this is set. This can have false positives
+    /// but never a false negative; it is cleared only with the whole row.
+    background: bool = false,
+
     /// True if this row is dirty and requires a redraw. This is set to true
     /// by any operation that modifies the row's contents or position, and
     /// consumers of the page are expected to clear it when they redraw.
@@ -2073,7 +2084,7 @@ pub const Row = packed struct(u64) {
     /// screen.
     dirty: bool = false,
 
-    _padding: u23 = 0,
+    _padding: u22 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {
@@ -2347,6 +2358,15 @@ pub const Cell = packed struct(u64) {
 
     pub inline fn hasStyling(self: Cell) bool {
         return self.style_id != stylepkg.default_id;
+    }
+
+    /// Whether this cell holds only a background colour (see
+    /// `Row.background`).
+    pub inline fn isBackground(self: Cell) bool {
+        return switch (self.content_tag) {
+            .bg_color_palette, .bg_color_rgb => true,
+            .codepoint, .codepoint_grapheme => false,
+        };
     }
 
     /// Returns true if the cell has no text or styling.

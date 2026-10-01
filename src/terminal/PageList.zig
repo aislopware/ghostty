@@ -2114,7 +2114,14 @@ const ReflowCursor = struct {
         if (dst_style_id != style_id) {
             for (dst_cells) |*cell| cell.style_id = dst_style_id;
         }
-        if (dst_style_id != stylepkg.default_id) self.page_row.styled = true;
+        if (dst_style_id != stylepkg.default_id) {
+            self.page_row.styled = true;
+        } else if (!self.page_row.background) {
+            for (dst_cells) |cell| if (cell.isBackground()) {
+                self.page_row.background = true;
+                break;
+            };
+        }
 
         // Advance the cursor, matching what repeated cursorForward
         // calls after each cell write would have done.
@@ -2226,6 +2233,7 @@ const ReflowCursor = struct {
                     // These are guaranteed to have no style or grapheme
                     // data associated with them so we can fast path them.
                     self.page_cell.* = cell.*;
+                    self.page_row.background = true;
                     self.cursorForward();
                     return .success;
                 },

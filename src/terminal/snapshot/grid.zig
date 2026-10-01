@@ -1242,9 +1242,12 @@ fn applyCell(
 
         // Only the palette index is meaningful; the remaining content bits
         // are reserved and must not obscure it.
-        .bg_color_palette => wire.content = @as(u8, @truncate(wire.content)),
+        .bg_color_palette => {
+            wire.content = @as(u8, @truncate(wire.content));
+            row.background = true;
+        },
 
-        .bg_color_rgb => {},
+        .bg_color_rgb => row.background = true,
     }
 
     // Reserved semantic content degrades to plain output.

@@ -6005,6 +6005,44 @@ test "Terminal: zero-width character attached without clustering marks dirty" {
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 }
 
+fn expectBackgroundRowsFlaggedForTest(t: *Terminal) !void {
+    var it = t.screens.active.pages.rowIterator(.right_down, .{ .screen = .{} }, null);
+    var seen: usize = 0;
+    while (it.next()) |pin| {
+        const row = pin.rowAndCell().row;
+        for (pin.cells(.all)) |cell| {
+            if (cell.content_tag == .bg_color_palette or cell.content_tag == .bg_color_rgb) {
+                try testing.expect(row.background);
+                seen += 1;
+            }
+        }
+    }
+    try testing.expect(seen > 0);
+}
+
+test "Terminal: a row holding a cell with only a background is flagged" {
+    const cases = [_]struct { input: []const u8, cols: size.CellCountInt = 0, rows: size.CellCountInt = 0 }{
+        // An erase under a coloured pen.
+        .{ .input = "ab\x1b[41m\x1b[K" },
+        // A scroll under one.
+        .{ .input = "\x1b[48;2;1;2;3m\r\n\r\n\r\n\r\n" },
+        // Characters inserted and deleted around the colour.
+        .{ .input = "\x1b[41m\x1b[2K\x1b[0m\x1b[3G\x1b[2@\x1b[2P" },
+        // Reflowed narrower and wider.
+        .{ .input = "\x1b[41m\x1b[2K\x1b[0mx", .cols = 3, .rows = 6 },
+        .{ .input = "\x1b[41m\x1b[2K\x1b[0mx", .cols = 10, .rows = 4 },
+    };
+    for (cases) |case| {
+        var t = try init(testing.io, testing.allocator, .{ .cols = 6, .rows = 4 });
+        defer t.deinit(testing.allocator);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.input);
+        if (case.cols != 0) try t.resize(testing.allocator, .{ .cols = case.cols, .rows = case.rows });
+        try expectBackgroundRowsFlaggedForTest(&t);
+    }
+}
+
 test "Terminal: a row's prompt flag changing marks it dirty" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
     defer t.deinit(testing.allocator);

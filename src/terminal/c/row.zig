@@ -51,12 +51,17 @@ pub const RowData = enum(c_int) {
     /// Output type: bool *
     dirty = 8,
 
+    /// Whether any cells in this row hold only a background colour (may
+    /// have false positives).
+    /// Output type: bool *
+    background = 9,
+
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: RowData) type {
         return switch (self) {
             .invalid => void,
             .wrap, .wrap_continuation, .grapheme, .styled, .hyperlink => bool,
-            .kitty_virtual_placeholder, .dirty => bool,
+            .kitty_virtual_placeholder, .dirty, .background => bool,
             .semantic_prompt => SemanticPrompt,
         };
     }
@@ -120,6 +125,7 @@ fn getTyped(
         .semantic_prompt => out.* = @enumFromInt(@intFromEnum(row.semantic_prompt)),
         .kitty_virtual_placeholder => out.* = row.kitty_virtual_placeholder,
         .dirty => out.* = row.dirty,
+        .background => out.* = row.background,
     }
 
     return .success;
