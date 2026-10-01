@@ -1812,7 +1812,7 @@ fn printWrap(self: *Terminal) !void {
     cursor.semantic_content_clear_eol = old_semantic_clear;
     switch (old_semantic) {
         .output, .input => {},
-        .prompt => cursor.page_row.semantic_prompt = .prompt_continuation,
+        .prompt => self.screens.active.cursorSetRowSemanticPrompt(.prompt_continuation),
     }
 
     if (mark_wrap) {
@@ -2219,7 +2219,7 @@ pub fn semanticPrompt(
             if (self.screens.active.cursor.page_row.semantic_prompt != .none and
                 self.screens.active.cursor.x == 0)
             {
-                self.screens.active.cursor.page_row.semantic_prompt = .none;
+                self.screens.active.cursorSetRowSemanticPrompt(.none);
             }
         },
 
@@ -2374,7 +2374,7 @@ pub fn index(self: *Terminal) !void {
             // This can be a false positive if the shell changes content
             // type later and outputs something. We handle that in the
             // semanticPrompt function.
-            screen.cursor.page_row.semantic_prompt = .prompt_continuation;
+            screen.cursorSetRowSemanticPrompt(.prompt_continuation);
         }
     } else {
         // This should never be set in the output mode.
@@ -6005,6 +6005,36 @@ test "Terminal: zero-width character attached without clustering marks dirty" {
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 }
 
+test "Terminal: a row's prompt flag changing marks it dirty" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // A prompt flags its row.
+    t.clearDirty();
+    s.nextSlice("\x1b]133;A\x07");
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+
+    // A newline in a prompt flags the next row a continuation.
+    s.nextSlice("$ ");
+    t.clearDirty();
+    s.nextSlice("\n");
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+
+    // A wrap in a prompt does too.
+    s.nextSlice("0123456789");
+    t.clearDirty();
+    s.nextSlice("x");
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
+
+    // Output started at the first column takes the flag off.
+    s.nextSlice("\r\n");
+    t.clearDirty();
+    s.nextSlice("\x1b]133;C\x07");
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 3 } }));
+}
+
 test "Terminal: multicodepoint grapheme marks dirty on every codepoint" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 80 });
     defer t.deinit(testing.allocator);
@@ -7203,10 +7233,9 @@ test "Terminal: soft wrap with semantic prompt" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 3, .rows = 80 });
     defer t.deinit(testing.allocator);
 
-    // Mark our prompt.
+    // Mark our prompt. The row's flag changes, which a render state copies.
     try t.semanticPrompt(.init(.prompt_start));
-    // Should not make anything dirty on its own.
-    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 
     // Write and wrap
     for ("hello") |c| try t.print(c);
