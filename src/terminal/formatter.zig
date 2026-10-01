@@ -887,12 +887,9 @@ pub const ScreenFormatter = struct {
 
         // Reformat the cell which sets the proper pending wrap state. An
         // empty cell formats as nothing, so it is written as the blank it
-        // draws as.
+        // draws as, with its semantic content set first as the cell
+        // formatter would.
         const cell = rac.cell;
-        if (cell.isEmpty() and !cell.hasStyling() and !cell.hyperlink) {
-            try writer.writeByte(' ');
-            return;
-        }
         var cell_formatter: PageFormatter = .init(pin.node.page(), self.opts);
         cell_formatter.start_x = x;
         cell_formatter.end_x = x;
@@ -902,6 +899,15 @@ pub const ScreenFormatter = struct {
             .{ .content = .prompt, .lone = true }
         else
             .{ .known = false, .lone = true };
+        if (cell.isEmpty() and !cell.hasStyling() and !cell.hyperlink) {
+            if (self.opts.emit == .vt and self.opts.semantic_prompt) {
+                var replay = cell_formatter.lone_cell.?;
+                replay.row = rac.row.semantic_prompt;
+                try replay.content_to(&cell_formatter, writer, cell.semantic_content, start_x, pin.y);
+            }
+            try writer.writeByte(' ');
+            return;
+        }
         try cell_formatter.format(writer);
     }
 
@@ -6442,6 +6448,49 @@ test "Terminal vt cursor keeps a pending wrap on a prompt row with its semantic 
         const content: Cell.SemanticContent = if (!flagged and
             want.page_cell.semantic_content == .prompt) .output else want.page_cell.semantic_content;
         try testing.expectEqual(content, got.page_cell.semantic_content);
+    }
+}
+
+test "Terminal vt cursor keeps the semantic content of an empty cell under a saved pending wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        // The saved cell is erased, and the live cursor is left in input.
+        "\x1b]133;A\x1b\\abcd\x1b7\x1b[2J\x1b[2;1H\x1b]133;B\x1b\\x",
+        // The same with the live cursor in prompt content.
+        "\x1b]133;A\x1b\\abcd\x1b7\x1b[2J\x1b[2;1H\x1b]133;A\x1b\\x",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+        try testing.expect(source.screens.active.saved_cursor.?.pending_wrap);
+
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: TerminalFormatter = .init(&source, .vt);
+        formatter.extra = .all;
+        formatter.opts.semantic_prompt = true;
+        formatter.opts.unwrap = true;
+        formatter.opts.trim = false;
+        try formatter.format(&builder.writer);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
+        defer target.deinit(alloc);
+        var target_stream = target.vtStream();
+        defer target_stream.deinit();
+        target_stream.nextSlice(builder.writer.buffered());
+
+        for (0..3) |y| for (0..4) |x| {
+            const at: point.Point = .{ .active = .{ .x = @intCast(x), .y = @intCast(y) } };
+            const want = source.screens.active.pages.pin(at).?.rowAndCell();
+            const got = target.screens.active.pages.pin(at).?.rowAndCell();
+            try testing.expectEqual(want.cell.semantic_content, got.cell.semantic_content);
+            try testing.expectEqual(want.row.semantic_prompt, got.row.semantic_prompt);
+        };
     }
 }
 
