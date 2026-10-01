@@ -314,6 +314,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_ROW_DATA_DIRTY = 8,
+
+  /**
+   * Whether any cells in this row hold only a background colour, with no
+   * style of their own (may have false positives).
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_ROW_DATA_BACKGROUND = 9,
   GHOSTTY_ROW_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRowData;
 
