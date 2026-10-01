@@ -1318,10 +1318,10 @@ const SemanticReplay = struct {
 };
 
 /// Whether a row's cells format as nothing: no text, and for styled formats
-/// no styling either (a background an erase left draws).
+/// no styling or hyperlink either (a background an erase left draws).
 fn blankRow(comptime emit: Format, cells: []const Cell) bool {
     if (comptime !formatStyled(emit)) return !Cell.hasTextAny(cells);
-    for (cells) |cell| if (!cell.isEmpty() or cell.hasStyling()) return false;
+    for (cells) |cell| if (!cell.isEmpty() or cell.hasStyling() or cell.hyperlink) return false;
     return true;
 }
 
@@ -1862,10 +1862,10 @@ pub const PageFormatter = struct {
                 // char sometime later.
                 blank: {
                     // If we're emitting styled output (not plaintext) and
-                    // the cell has some kind of styling or is not empty
-                    // then this isn't blank.
+                    // the cell has some kind of styling, a hyperlink or is
+                    // not empty then this isn't blank.
                     if (comptime formatStyled(emit)) {
-                        if (!cell.isEmpty() or cell.hasStyling()) break :blank;
+                        if (!cell.isEmpty() or cell.hasStyling() or cell.hyperlink) break :blank;
                     }
 
                     // Cells with no text are blank
@@ -2271,10 +2271,10 @@ pub const PageFormatter = struct {
 
             // Blank cell accounting, matching the slow path blank block.
             if (comptime formatStyled(emit)) {
-                // Styled formats only treat unstyled empty cells as
-                // blank; anything else (including spaces) is written
-                // so that styling is preserved.
-                if (cp == 0 and cell.wide == .narrow and run_style_id == 0) {
+                // Styled formats only treat unstyled empty cells outside
+                // any hyperlink as blank; anything else (including spaces)
+                // is written so that styling is preserved.
+                if (cp == 0 and cell.wide == .narrow and run_style_id == 0 and !cell.hyperlink) {
                     pending += 1;
                     continue;
                 }
@@ -7850,6 +7850,46 @@ test "Page VT keeps a row that only holds a background" {
     const got = try vt.format(&t2);
     defer alloc.free(got);
     try testing.expectEqualStrings(want, got);
+}
+
+test "Page VT keeps a hyperlink on a cell with no text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // A wide character a single column cannot hold prints as an empty cell,
+    // and so does one at a right margin, both under the open hyperlink.
+    const cases = [_]struct { cols: size.CellCountInt, input: []const u8 }{
+        .{ .cols = 1, .input = "\x1b]8;;http://a\x1b\\\u{4e2d}\x1b]8;;\x1b\\\r\nx" },
+        .{ .cols = 6, .input = "\x1b[?69h\x1b[1;3s\x1b[3G\x1b]8;;http://a\x1b\\\u{4e2d}\x1b]8;;\x1b\\\x1b[s\x1b[?69l\x1b[3;1Hx" },
+    };
+    for (cases) |case| {
+        var t = try Terminal.init(io, alloc, .{ .cols = case.cols, .rows = 3 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.input);
+
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: PageListFormatter = .init(&t.screens.active.pages, .{ .emit = .vt });
+        try formatter.format(&builder.writer);
+        var t2 = try Terminal.init(io, alloc, .{ .cols = case.cols, .rows = 3 });
+        defer t2.deinit(alloc);
+        var s2 = t2.vtStream();
+        defer s2.deinit();
+        s2.nextSlice(builder.writer.buffered());
+
+        var linked: usize = 0;
+        for (0..t.rows) |y| for (0..t.cols) |x| {
+            const at: point.Point = .{ .active = .{ .x = @intCast(x), .y = @intCast(y) } };
+            const want = t.screens.active.pages.getCell(at).?.cell;
+            const got = t2.screens.active.pages.getCell(at).?.cell;
+            try testing.expectEqual(want.hyperlink, got.hyperlink);
+            if (want.hyperlink) linked += 1;
+        };
+        try testing.expect(linked > 0);
+    }
 }
 
 test "Page VT unwrap replays soft wraps" {
