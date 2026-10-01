@@ -2835,12 +2835,10 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     const rows = page.rows.ptr(page.memory);
                     for (0..page.size.rows) |i| {
                         const row = &rows[i];
-                        page.clearCells(row, cols, self.cols);
-
-                        // A wide character the new edge cuts in half has
-                        // lost its spacer tail and no longer fits.
-                        const cells = page.getCells(row);
-                        if (cells[cols - 1].wide == .wide) page.clearCells(row, cols - 1, cols);
+                        // If the cut splits a wide char, clear its head too.
+                        const cells = row.cells.ptr(page.memory);
+                        const start = if (cells[cols - 1].wide == .wide) cols - 1 else cols;
+                        page.clearCells(row, start, self.cols);
                     }
 
                     page.size.cols = cols;
