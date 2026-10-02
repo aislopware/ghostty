@@ -256,7 +256,16 @@ pub const LoadingImage = struct {
 
         // Get the memory range we'll read. Validate it to make sure
         // it doesn't overflow.
-        const range = try self.sharedMemoryRange(t, stat_size);
+        const range = try self.dataRange(t, stat_size);
+
+        // Where the object can be read, it is: the program that made it may
+        // shrink it at any time, and copying from a mapping past its new end
+        // raises SIGBUS, which would take the whole host down. A read past the
+        // end is only short. macOS takes no read of a shared memory object but
+        // never resizes one once it is sized, so a mapping is safe there.
+        if (comptime !builtin.target.os.tag.isDarwin()) {
+            return self.readRange(io, alloc, file, range);
+        }
 
         const map = std.posix.mmap(
             null,
@@ -275,20 +284,22 @@ pub const LoadingImage = struct {
         try self.data.appendSlice(alloc, map[range.start..range.end]);
     }
 
-    const SharedMemoryRange = struct {
+    const DataRange = struct {
         start: usize,
         end: usize,
     };
 
-    /// Returns the byte range to copy from a shared memory object.
-    fn sharedMemoryRange(
+    /// Returns the byte range to copy from a file or shared memory object
+    /// of `stat_size` bytes: `S` bytes when given, else as many as an
+    /// uncompressed image of the given dimensions takes, else the rest.
+    fn dataRange(
         self: *const LoadingImage,
         t: command.Transmission,
         stat_size: usize,
     ) error{
         InvalidData,
         DimensionsTooLarge,
-    }!SharedMemoryRange {
+    }!DataRange {
         const expected_size: ?usize = switch (self.image.format) {
             // PNG dimensions come from the decoded data.
             .png => null,
@@ -330,6 +341,31 @@ pub const LoadingImage = struct {
         return .{ .start = start, .end = start + data_size };
     }
 
+    /// Reads `range` of `file` into the image data with positional reads.
+    /// A file that shrank since it was sized reads short, which is invalid.
+    fn readRange(
+        self: *LoadingImage,
+        io: std.Io,
+        alloc: Allocator,
+        file: std.Io.File,
+        range: DataRange,
+    ) !void {
+        assert(self.data.items.len == 0);
+        const len = range.end - range.start;
+        try self.data.ensureTotalCapacityPrecise(alloc, len);
+        self.data.items.len = len;
+        const read = file.readPositionalAll(io, self.data.items, range.start) catch |err| {
+            log.warn("failed to read image data: {}", .{err});
+            self.data.items.len = 0;
+            return error.InvalidData;
+        };
+        if (read != len) {
+            log.warn("image data shorter than expected read={} expected={}", .{ read, len });
+            self.data.items.len = 0;
+            return error.InvalidData;
+        }
+    }
+
     /// Reads the data from a temporary file and returns it. This allocates
     /// and does not free any of the data, so the caller must free it.
     ///
@@ -366,13 +402,21 @@ pub const LoadingImage = struct {
         const abs_buf = try alloc.alloc(u8, std.fs.max_path_bytes);
         defer alloc.free(abs_buf);
 
+        // On POSIX the path is checked before it is opened too, as Kitty
+        // does: opening a device can have side effects, and opening a FIFO
+        // blocks until something writes to it, which would stall the
+        // terminal for good. The opened file is checked again below, so a
+        // path swapped in between gains nothing.
+        if (comptime posix_open) {
+            checkPathBeforeOpen(io, path, abs_buf) catch |err| {
+                log.warn("refusing image file: {}", .{err});
+                return error.InvalidData;
+            };
+        }
+
         // Open our file right away before we do validation. This avoids
         // TOCTOU issues.
-        var file = std.Io.Dir.cwd().openFile(
-            io,
-            path,
-            .{},
-        ) catch |err| {
+        var file = openImageFile(io, path) catch |err| {
             log.warn("failed to open image file: {}", .{err});
             return error.InvalidData;
         };
@@ -418,55 +462,55 @@ pub const LoadingImage = struct {
         }
 
         // File must be a regular file
-        if (file.stat(io)) |stat| {
-            if (stat.kind != .file) {
-                log.warn("file is not a regular file kind={}", .{stat.kind});
-                return error.InvalidData;
-            }
-        } else |err| {
+        const stat = file.stat(io) catch |err| {
             log.warn("failed to stat file: {}", .{err});
+            return error.InvalidData;
+        };
+        if (stat.kind != .file) {
+            log.warn("file is not a regular file kind={}", .{stat.kind});
             return error.InvalidData;
         }
 
-        var buf: [4096]u8 = undefined;
-        var buf_reader = file.reader(io, &buf);
-        if (t.offset > 0) {
-            buf_reader.seekTo(@intCast(t.offset)) catch |err| {
-                log.warn("failed to seek to offset {}: {}", .{ t.offset, err });
-                return error.InvalidData;
-            };
-        }
-        const reader = &buf_reader.interface;
+        // Read only what the image takes, as Kitty does: S bytes when given
+        // (exact, not a maximum: https://sw.kovidgoyal.net/kitty/graphics-protocol/#local-client),
+        // an uncompressed image's own size, else the rest of the file. The
+        // range is checked against the file's size before anything is read,
+        // so a file too large is refused at once rather than read to the
+        // limit first.
+        const stat_size = std.math.cast(usize, stat.size) orelse
+            return error.InvalidData;
+        try self.readRange(io, alloc, file, try self.dataRange(t, stat_size));
+    }
 
-        // Read the file
-        var managed: std.ArrayList(u8) = .empty;
-        errdefer managed.deinit(alloc);
-        if (t.size > 0) {
-            // S is the exact number of bytes to read, not a maximum:
-            // https://sw.kovidgoyal.net/kitty/graphics-protocol/#local-client
-            const size = std.math.cast(usize, t.size) orelse
-                return error.InvalidData;
-            if (size > max_size) return error.InvalidData;
+    /// Whether the file mediums open files with POSIX `openat` (non-blocking,
+    /// never as the controlling terminal) rather than through `std.Io`.
+    const posix_open = switch (builtin.os.tag) {
+        .windows, .wasi, .freestanding => false,
+        else => true,
+    };
 
-            // Read exact size
-            const data = reader.readAlloc(alloc, size) catch |err| {
-                log.warn("failed to read image file: {}", .{err});
-                return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => error.InvalidData,
-                };
-            };
-            managed = .{ .items = data, .capacity = data.len };
-        } else {
-            reader.appendRemaining(alloc, &managed, .limited(max_size)) catch {
-                log.warn("failed to read image file: {?}", .{buf_reader.err});
-                return error.InvalidData;
-            };
-        }
+    /// Opens an image file for reading. On POSIX it is opened non-blocking,
+    /// as Kitty does, so a FIFO or a device swapped in after the checks
+    /// cannot block the open, and never as the controlling terminal.
+    fn openImageFile(io: std.Io, path: []const u8) !std.Io.File {
+        if (comptime !posix_open) return std.Io.Dir.cwd().openFile(io, path, .{});
+        const fd = try posix.openat(posix.AT.FDCWD, path, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .NOCTTY = true,
+            .CLOEXEC = true,
+        }, 0);
+        return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    }
 
-        // Set our data
-        assert(self.data.items.len == 0);
-        self.data = .{ .items = managed.items, .capacity = managed.capacity };
+    /// Refuses `path` before it is opened when it resolves into the
+    /// blocklist or to anything but a regular file. `buf` holds the
+    /// resolved path.
+    fn checkPathBeforeOpen(io: std.Io, path: []const u8, buf: []u8) !void {
+        const real = buf[0..try std.Io.Dir.cwd().realPathFile(io, path, buf)];
+        try checkBlocklist(real);
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+        if (stat.kind != .file) return error.NotRegularFile;
     }
 
     /// Returns the canonical path of an open file after applying the file
@@ -479,8 +523,14 @@ pub const LoadingImage = struct {
             return path;
         }
 
-        // This is logic copied directly from Kitty, mostly. This is really
-        // rough but it will catch obvious bad actors.
+        try checkBlocklist(path);
+        return path;
+    }
+
+    /// Refuses a canonical POSIX path under `/proc`, `/sys` or `/dev` (but
+    /// `/dev/shm`). This is logic copied directly from Kitty, mostly. This
+    /// is really rough but it will catch obvious bad actors.
+    fn checkBlocklist(path: []const u8) error{InvalidData}!void {
         if (std.mem.startsWith(u8, path, "/proc/") or
             std.mem.startsWith(u8, path, "/sys/") or
             (std.mem.startsWith(u8, path, "/dev/") and
@@ -488,8 +538,6 @@ pub const LoadingImage = struct {
         {
             return error.InvalidData;
         }
-
-        return path;
     }
 
     /// Returns true if path appears to be in a temporary directory.
@@ -972,7 +1020,69 @@ test "image load rejects invalid POSIX shared memory names" {
     );
 }
 
-test "shared memory range with offset and size" {
+test "image load: shared memory is read and unlinked" {
+    if (comptime builtin.abi.isAndroid() or
+        builtin.target.os.tag == .windows or
+        !builtin.link_libc)
+    {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Short: macOS holds a shared memory name to 31 bytes.
+    var name_buf: [32]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/gt-kitty-{d}", .{std.c.getpid()});
+    const pixels = [_]u8{ 1, 2, 3 };
+    {
+        const mode: if (builtin.target.os.tag.isDarwin()) c_uint else std.c.mode_t = 0o600;
+        const flags: c_int = @bitCast(std.c.O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true });
+        const fd = std.c.shm_open(name, flags, mode);
+        try testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        try testing.expectEqual(@as(c_int, 0), std.c.ftruncate(fd, pixels.len));
+        // A shared memory object on macOS takes no write(2), only a mapping.
+        const map = try std.posix.mmap(
+            null,
+            pixels.len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        defer std.posix.munmap(map);
+        @memcpy(map[0..pixels.len], &pixels);
+    }
+    errdefer _ = std.c.shm_unlink(name);
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .shared_memory,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, name),
+    };
+    defer cmd.deinit(alloc);
+    var loading = try LoadingImage.init(io, alloc, &cmd, .{
+        .file = false,
+        .temporary_file = .disabled,
+        .shared_memory = true,
+    });
+    defer loading.deinit(alloc);
+    var img = try loading.complete(alloc);
+    defer img.deinit(alloc);
+    try testing.expectEqualSlices(u8, &pixels, img.data.complete);
+
+    // The object is gone once read.
+    try testing.expect(std.c.shm_unlink(name) != 0);
+}
+
+test "data range with offset and size" {
     const testing = std.testing;
 
     const loading: LoadingImage = .{
@@ -985,21 +1095,21 @@ test "shared memory range with offset and size" {
         .temporary_directory = null,
     };
 
-    const explicit = try loading.sharedMemoryRange(.{
+    const explicit = try loading.dataRange(.{
         .offset = 2,
         .size = 3,
     }, 5);
     try testing.expectEqual(@as(usize, 2), explicit.start);
     try testing.expectEqual(@as(usize, 5), explicit.end);
 
-    const implicit = try loading.sharedMemoryRange(.{
+    const implicit = try loading.dataRange(.{
         .offset = 2,
     }, 5);
     try testing.expectEqual(@as(usize, 2), implicit.start);
     try testing.expectEqual(@as(usize, 5), implicit.end);
 }
 
-test "shared memory range rejects out of bounds offset" {
+test "data range rejects out of bounds offset" {
     const loading: LoadingImage = .{
         .image = .{
             .width = 1,
@@ -1012,11 +1122,11 @@ test "shared memory range rejects out of bounds offset" {
 
     try std.testing.expectError(
         error.InvalidData,
-        loading.sharedMemoryRange(.{ .offset = 4 }, 3),
+        loading.dataRange(.{ .offset = 4 }, 3),
     );
 }
 
-test "shared memory range validates dimensions before multiplication" {
+test "data range validates dimensions before multiplication" {
     const loading: LoadingImage = .{
         .image = .{
             .width = std.math.maxInt(u32),
@@ -1029,7 +1139,7 @@ test "shared memory range validates dimensions before multiplication" {
 
     try std.testing.expectError(
         error.DimensionsTooLarge,
-        loading.sharedMemoryRange(.{}, 1),
+        loading.dataRange(.{}, 1),
     );
 }
 
@@ -1568,6 +1678,135 @@ test "image load: blocklist applies to opened file after symlink swap" {
     const safe_file = try tmp_dir.dir.openFile(io, "image.data", .{});
     defer safe_file.close(io);
     _ = try LoadingImage.validatedFilePath(io, safe_file, &path_buf);
+}
+
+test "image load: a FIFO is refused without blocking" {
+    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+
+    // Nothing ever writes to it, so opening it blocking would never return.
+    const mkfifo = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    }.mkfifo;
+    var fifo_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const fifo = try std.fmt.bufPrintZ(&fifo_buf, "{s}/tty-graphics-protocol.fifo", .{dir});
+    try testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
+    try tmp_dir.dir.symLink(io, fifo, "tty-graphics-protocol.link", .{});
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}/tty-graphics-protocol.link", .{dir});
+
+    for ([_][]const u8{ fifo, link }) |path| {
+        for ([_]command.Transmission.Medium{ .file, .temporary_file }) |medium| {
+            var cmd: command.Command = .{
+                .control = .{ .transmit = .{
+                    .format = .rgb,
+                    .medium = medium,
+                    .width = 1,
+                    .height = 1,
+                    .image_id = 31,
+                } },
+                .data = try alloc.dupe(u8, path),
+            };
+            defer cmd.deinit(alloc);
+            try testing.expectError(
+                error.InvalidData,
+                LoadingImage.init(io, alloc, &cmd, .allWithTempDir(dir)),
+            );
+        }
+    }
+
+    // A temporary file that is not a regular file is not deleted either.
+    try tmp_dir.dir.access(io, "tty-graphics-protocol.fifo", .{});
+}
+
+test "image load: an uncompressed image reads only its own size from a file" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // Two 1x1 RGB images back to back, as a program may keep several in one
+    // file and name each by its offset.
+    try tmp_dir.dir.writeFile(io, .{
+        .sub_path = "images.data",
+        .data = &.{ 1, 2, 3, 4, 5, 6 },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp_dir.dir.realPathFile(io, "images.data", &path_buf)];
+
+    for ([_]struct { offset: u32, expected: [3]u8 }{
+        .{ .offset = 0, .expected = .{ 1, 2, 3 } },
+        .{ .offset = 3, .expected = .{ 4, 5, 6 } },
+    }) |case| {
+        var cmd: command.Command = .{
+            .control = .{ .transmit = .{
+                .format = .rgb,
+                .medium = .file,
+                .width = 1,
+                .height = 1,
+                .offset = case.offset,
+                .image_id = 31,
+            } },
+            .data = try alloc.dupe(u8, path),
+        };
+        defer cmd.deinit(alloc);
+        var loading = try LoadingImage.init(io, alloc, &cmd, .{
+            .file = true,
+            .temporary_file = .disabled,
+            .shared_memory = false,
+        });
+        defer loading.deinit(alloc);
+        var img = try loading.complete(alloc);
+        defer img.deinit(alloc);
+        try testing.expectEqualSlices(u8, &case.expected, img.data.complete);
+    }
+}
+
+test "image load: a file larger than the limit is refused before it is read" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // Sparse: it takes no room, and reading it would take seconds.
+    {
+        const file = try tmp_dir.dir.createFile(io, "big.data", .{});
+        defer file.close(io);
+        try file.setLength(io, max_size + 1);
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp_dir.dir.realPathFile(io, "big.data", &path_buf)];
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .file,
+            .compression = .zlib_deflate,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+    defer cmd.deinit(alloc);
+    try testing.expectError(
+        error.InvalidData,
+        LoadingImage.init(io, alloc, &cmd, .{
+            .file = true,
+            .temporary_file = .disabled,
+            .shared_memory = false,
+        }),
+    );
 }
 
 test "image load: windows UNC path is rejected before open" {
