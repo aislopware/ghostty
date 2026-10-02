@@ -130,6 +130,7 @@ pub const Action = union(Key) {
     semantic_prompt: SemanticPrompt,
     kitty_clipboard: KittyClipboard,
     kitty_dnd: KittyDnd,
+    kitty_desktop_notification: KittyDesktopNotification,
     resize_window: ResizeWindow,
     osc_unknown: osc.Command.Unknown,
     mouse_shape_reset,
@@ -234,6 +235,7 @@ pub const Action = union(Key) {
             "semantic_prompt",
             "kitty_clipboard",
             "kitty_dnd",
+            "kitty_desktop_notification",
             "resize_window",
             "osc_unknown",
             "mouse_shape_reset",
@@ -468,6 +470,7 @@ pub const Action = union(Key) {
     pub const KittyClipboard = osc.Command.KittyClipboardProtocol;
 
     pub const KittyDnd = osc.Command.KittyDndProtocol;
+    pub const KittyDesktopNotification = osc.Command.KittyDesktopNotification;
 };
 
 /// Returns a type that can process a stream of tty control characters.
@@ -2725,6 +2728,10 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.kitty_dnd, v);
                 },
 
+                .kitty_desktop_notification => |v| {
+                    self.handler.vt(.kitty_desktop_notification, v);
+                },
+
                 .unknown => |v| {
                     @branchHint(.unlikely);
                     self.handler.vt(.osc_unknown, v);
@@ -2740,7 +2747,6 @@ pub fn Stream(comptime H: type) type {
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,
-                .kitty_desktop_notification,
                 .context_signal,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});
