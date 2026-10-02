@@ -13,6 +13,7 @@ const kitty_windows = @import("windows.zig");
 const PageList = @import("../PageList.zig");
 const sys = @import("../sys.zig");
 const LimitedAllocator = @import("../../datastruct/main.zig").LimitedAllocator;
+const TinyIo = @import("../../lib/TinyIo.zig");
 
 const log = std.log.scoped(.kitty_gfx);
 
@@ -402,11 +403,12 @@ pub const LoadingImage = struct {
         const abs_buf = try alloc.alloc(u8, std.fs.max_path_bytes);
         defer alloc.free(abs_buf);
 
-        // On POSIX the path is checked before it is opened too, as Kitty
-        // does: opening a device can have side effects, and opening a FIFO
-        // blocks until something writes to it, which would stall the
-        // terminal for good. The opened file is checked again below, so a
-        // path swapped in between gains nothing.
+        // On POSIX the resolved path is checked against the blocklist before
+        // it is opened too, as Kitty does: opening a device can have side
+        // effects or block. A FIFO, which would block a blocking open until
+        // something writes to it, opens at once non-blocking and is refused
+        // below as not a regular file. The opened file is checked again, so
+        // a path swapped in between gains nothing.
         if (comptime posix_open) {
             checkPathBeforeOpen(io, path, abs_buf) catch |err| {
                 log.warn("refusing image file: {}", .{err});
@@ -504,13 +506,9 @@ pub const LoadingImage = struct {
     }
 
     /// Refuses `path` before it is opened when it resolves into the
-    /// blocklist or to anything but a regular file. `buf` holds the
-    /// resolved path.
+    /// blocklist. `buf` holds the resolved path.
     fn checkPathBeforeOpen(io: std.Io, path: []const u8, buf: []u8) !void {
-        const real = buf[0..try std.Io.Dir.cwd().realPathFile(io, path, buf)];
-        try checkBlocklist(real);
-        const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
-        if (stat.kind != .file) return error.NotRegularFile;
+        try checkBlocklist(buf[0..try std.Io.Dir.cwd().realPathFile(io, path, buf)]);
     }
 
     /// Returns the canonical path of an open file after applying the file
@@ -1680,6 +1678,13 @@ test "image load: blocklist applies to opened file after symlink swap" {
     _ = try LoadingImage.validatedFilePath(io, safe_file, &path_buf);
 }
 
+/// The `std.Io` implementations the file tests load with: the test
+/// runner's, and the TinyIo the libghostty-vt C API loads with, which
+/// implements fewer operations.
+fn testIos() [2]std.Io {
+    return .{ std.testing.io, TinyIo.init.io() };
+}
+
 test "image load: a FIFO is refused without blocking" {
     if (comptime builtin.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
 
@@ -1698,13 +1703,16 @@ test "image load: a FIFO is refused without blocking" {
     }.mkfifo;
     var fifo_buf: [std.fs.max_path_bytes]u8 = undefined;
     const fifo = try std.fmt.bufPrintZ(&fifo_buf, "{s}/tty-graphics-protocol.fifo", .{dir});
-    try testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
     try tmp_dir.dir.symLink(io, fifo, "tty-graphics-protocol.link", .{});
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const link = try std.fmt.bufPrint(&link_buf, "{s}/tty-graphics-protocol.link", .{dir});
 
-    for ([_][]const u8{ fifo, link }) |path| {
+    for (testIos()) |load_io| for ([_][]const u8{ fifo, link }) |path| {
         for ([_]command.Transmission.Medium{ .file, .temporary_file }) |medium| {
+            // A temporary file is deleted once opened, as in Kitty, even
+            // when it is refused, so each load gets the FIFO afresh.
+            tmp_dir.dir.access(io, "tty-graphics-protocol.fifo", .{}) catch
+                try testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
             var cmd: command.Command = .{
                 .control = .{ .transmit = .{
                     .format = .rgb,
@@ -1718,13 +1726,11 @@ test "image load: a FIFO is refused without blocking" {
             defer cmd.deinit(alloc);
             try testing.expectError(
                 error.InvalidData,
-                LoadingImage.init(io, alloc, &cmd, .allWithTempDir(dir)),
+                LoadingImage.init(load_io, alloc, &cmd, .allWithTempDir(dir)),
             );
+            if (medium == .file) try tmp_dir.dir.access(io, "tty-graphics-protocol.fifo", .{});
         }
-    }
-
-    // A temporary file that is not a regular file is not deleted either.
-    try tmp_dir.dir.access(io, "tty-graphics-protocol.fifo", .{});
+    };
 }
 
 test "image load: an uncompressed image reads only its own size from a file" {
@@ -1743,7 +1749,7 @@ test "image load: an uncompressed image reads only its own size from a file" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp_dir.dir.realPathFile(io, "images.data", &path_buf)];
 
-    for ([_]struct { offset: u32, expected: [3]u8 }{
+    for (testIos()) |load_io| for ([_]struct { offset: u32, expected: [3]u8 }{
         .{ .offset = 0, .expected = .{ 1, 2, 3 } },
         .{ .offset = 3, .expected = .{ 4, 5, 6 } },
     }) |case| {
@@ -1759,7 +1765,7 @@ test "image load: an uncompressed image reads only its own size from a file" {
             .data = try alloc.dupe(u8, path),
         };
         defer cmd.deinit(alloc);
-        var loading = try LoadingImage.init(io, alloc, &cmd, .{
+        var loading = try LoadingImage.init(load_io, alloc, &cmd, .{
             .file = true,
             .temporary_file = .disabled,
             .shared_memory = false,
@@ -1768,7 +1774,7 @@ test "image load: an uncompressed image reads only its own size from a file" {
         var img = try loading.complete(alloc);
         defer img.deinit(alloc);
         try testing.expectEqualSlices(u8, &case.expected, img.data.complete);
-    }
+    };
 }
 
 test "image load: a file larger than the limit is refused before it is read" {
@@ -1799,9 +1805,9 @@ test "image load: a file larger than the limit is refused before it is read" {
         .data = try alloc.dupe(u8, path),
     };
     defer cmd.deinit(alloc);
-    try testing.expectError(
+    for (testIos()) |load_io| try testing.expectError(
         error.InvalidData,
-        LoadingImage.init(io, alloc, &cmd, .{
+        LoadingImage.init(load_io, alloc, &cmd, .{
             .file = true,
             .temporary_file = .disabled,
             .shared_memory = false,
