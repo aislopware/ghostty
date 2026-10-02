@@ -19,6 +19,7 @@ const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
 const paste_pkg = @import("paste.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
+const kitty_notification = @import("kitty/notification.zig");
 const lib = @import("lib.zig");
 const size_report = @import("size_report.zig");
 const simd = @import("../simd/main.zig");
@@ -80,6 +81,9 @@ pub const Handler = struct {
     /// transaction, if any. Null means no transaction is active.
     /// Heap-allocated since transactions are rare and short-lived.
     kitty_clipboard_write: ?*kitty_clipboard.WriteState = null,
+
+    /// A Kitty desktop notification (OSC 99) arriving in chunks.
+    kitty_notification: kitty_notification.State = .{},
 
     /// Kitty clipboard protocol (OSC 5522) session password grants,
     /// recorded when a clipboard_read or clipboard_write reply asks to
@@ -457,6 +461,7 @@ pub const Handler = struct {
     pub fn deinit(self: *Handler) void {
         self.kittyClipboardAbort();
         self.kitty_clipboard_grants.deinit(self.terminal.gpa());
+        self.kitty_notification.deinit(self.terminal.gpa());
         self.apc_handler.deinit();
         self.dcs_handler.deinit();
     }
@@ -732,6 +737,9 @@ pub const Handler = struct {
             // Effect-based handlers
             .bell => self.bell(),
             .show_desktop_notification => self.desktopNotification(value),
+            .kitty_desktop_notification => self.kittyDesktopNotification(value) catch |err| {
+                log.warn("error handling kitty desktop notification err={}", .{err});
+            },
             .device_attributes => self.reportDeviceAttributes(value),
             .device_status => self.deviceStatus(value.request),
             .enquiry => self.reportEnquiry(),
@@ -866,6 +874,30 @@ pub const Handler = struct {
     ) void {
         const func = self.effects.desktop_notification orelse return;
         func(self, notification);
+    }
+
+    /// A Kitty desktop notification (OSC 99): a finished one goes to the
+    /// same effect as OSC 9 and OSC 777. Without that effect nothing can
+    /// show it, so the sequence is ignored, the query included, and the
+    /// program falls back to whatever it does without the protocol.
+    fn kittyDesktopNotification(
+        self: *Handler,
+        v: Action.KittyDesktopNotification,
+    ) (Allocator.Error || std.Io.Writer.Error)!void {
+        const func = self.effects.desktop_notification orelse return;
+
+        var stack = std.heap.stackFallback(128, self.terminal.gpa());
+        const response_alloc = stack.get();
+        var aw: std.Io.Writer.Allocating = .init(response_alloc);
+        defer aw.deinit();
+
+        const done = try self.kitty_notification.handle(
+            self.terminal.gpa(),
+            &aw.writer,
+            v,
+        );
+        if (aw.written().len > 0) self.writePty(aw.written());
+        if (done) |n| func(self, .{ .title = n.title, .body = n.body });
     }
 
     fn semanticPrompt(self: *Handler, cmd: osc.Command.SemanticPrompt) !void {
@@ -3783,6 +3815,67 @@ test "desktop_notification effect callback" {
     try testing.expectEqual(@as(usize, 2), S.count);
     try testing.expectEqualStrings("Codex", S.last_title);
     try testing.expectEqualStrings("Needs attention", S.last_body);
+}
+
+test "kitty desktop notification through the desktop_notification effect" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var count: usize = 0;
+        var title: [64]u8 = undefined;
+        var title_len: usize = 0;
+        var body: [64]u8 = undefined;
+        var body_len: usize = 0;
+        var pty: std.ArrayList(u8) = .empty;
+
+        fn writePty(_: *Handler, data: []const u8) void {
+            pty.appendSlice(testing.allocator, data) catch @panic("OOM");
+        }
+
+        fn desktopNotification(
+            _: *Handler,
+            notification: Action.ShowDesktopNotification,
+        ) void {
+            count += 1;
+            @memcpy(title[0..notification.title.len], notification.title);
+            title_len = notification.title.len;
+            @memcpy(body[0..notification.body.len], notification.body);
+            body_len = notification.body.len;
+        }
+    };
+    S.count = 0;
+    S.pty = .empty;
+    defer S.pty.deinit(testing.allocator);
+
+    // Without the effect nothing could show it, so even the query goes
+    // unanswered and the program falls back.
+    {
+        var handler: Handler = .init(&t);
+        handler.effects.write_pty = &S.writePty;
+        var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+        defer s.deinit();
+        s.nextSlice("\x1B]99;i=q:p=?;\x1B\\\x1B]99;;Ignored\x1B\\");
+        try testing.expectEqualStrings("", S.pty.items);
+    }
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.desktop_notification = &S.desktopNotification;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]99;i=q:p=?;\x07");
+    try testing.expectEqualStrings("\x1B]99;i=q:p=?;o=always:p=title,body,?\x07", S.pty.items);
+
+    // A title in two chunks, then its body, which is done.
+    s.nextSlice("\x1B]99;i=1:d=0;Build\x1B\\");
+    s.nextSlice("\x1B]99;i=1:d=0:e=1;IGRvbmU=\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.count);
+    s.nextSlice("\x1B]99;i=1:p=body;All tests passed\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqualStrings("Build done", S.title[0..S.title_len]);
+    try testing.expectEqualStrings("All tests passed", S.body[0..S.body_len]);
 }
 
 test "progress_report effect callback" {
