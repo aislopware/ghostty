@@ -2173,6 +2173,43 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_OPT_RESET = 43,
 
   /**
+   * Enable checksum reports in response to DECRQCRA (CSI Pi ; Pg ; Pt ; Pl ;
+   * Pb ; Pr * y).
+   *
+   * This is disabled by default because a running program can checksum the
+   * screen one cell at a time and so read back everything on it, including
+   * output from other programs. Passing NULL or a pointer to false disables
+   * checksum reporting.
+   *
+   * While this is disabled, XTCHECKSUM (CSI Ps # y), which changes how the
+   * checksum is calculated, is ignored as well.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_XT_CHECKSUM_REPORT = 44,
+
+  /**
+   * Set how the DECRQCRA checksum is calculated after a full reset (RIS).
+   * This also changes the current calculation.
+   *
+   * The value holds the same bits as XTCHECKSUM (CSI Ps # y) and xterm's
+   * checksumExtension resource, which a running program can still use to
+   * change the calculation until the next reset:
+   *
+   *   - 1: don't negate the result
+   *   - 2: don't add the video attributes of each cell
+   *   - 4: don't omit blanks
+   *   - 8: count cells that were never written to as spaces
+   *   - 16: use full codepoints instead of the DEC 8-bit values
+   *
+   * Zero, or passing NULL, is the calculation of a real DEC terminal.
+   * Values above 31 return GHOSTTY_INVALID_VALUE.
+   *
+   * Input type: uint8_t*
+   */
+  GHOSTTY_TERMINAL_OPT_XT_CHECKSUM_EXTENSION = 45,
+
+  /**
    * Callback invoked when the running program changes Kitty drag and
    * drop protocol (OSC 72) state in a way the embedder may need to act
    * on. Setting it enables the protocol; while it is NULL, OSC 72 is
@@ -2180,7 +2217,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Input type: GhosttyTerminalKittyDndFn
    */
-  GHOSTTY_TERMINAL_OPT_KITTY_DND = 44,
+  GHOSTTY_TERMINAL_OPT_KITTY_DND = 46,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
