@@ -6,20 +6,18 @@
 //! native OS drag and drop. A client registers to accept drops (t=a);
 //! the terminal then forwards native drag movement (t=m) and drops
 //! (t=M) to it and serves the dropped data on request (t=r), instead
-//! of the traditional behavior of pasting dropped paths or text.
+//! of the traditional behavior of pasting dropped paths or text. See
+//! `DropTarget`.
+//!
+//! The embedder connects the protocol to the OS: `handleCommand`
+//! processes client commands and returns `Event`s saying what changed,
+//! and the embedder reports native drag activity by calling the
+//! `DropTarget` functions of `State`.
 //!
 //! ## Divergences
 //!
 //! These will be fixed in the future:
 //!
-//!   * Dropped data is captured eagerly at drop time from a curated
-//!     set of representations the embedder can serve (typically
-//!     text/uri-list and text/plain), rather than fetched from the OS
-//!     on demand. Consequently the native drag session concludes at
-//!     drop time and the client's concluding operation (t=r with
-//!     x=y=Y=0) only frees the held data, and kitty's 128-entry
-//!     request queue and EMFILE overflow handling are unnecessary
-//!     because requests are served synchronously in order.
 //!   * Every client is treated as local: machine IDs (t=a:x=1) are
 //!     accepted and ignored, responses never carry the X=1 remote
 //!     marker, and remote file transfer requests (t=r with y or Y
@@ -40,6 +38,7 @@
 
 const dnd_command = @import("dnd_command.zig");
 const dnd_response = @import("dnd_response.zig");
+const dnd_state = @import("dnd_state.zig");
 const dnd_drop = @import("dnd_drop.zig");
 
 pub const EventType = dnd_command.EventType;
@@ -54,16 +53,21 @@ pub const RequestKeys = dnd_response.RequestKeys;
 pub const encode = dnd_response.encode;
 pub const encodeError = dnd_response.encodeError;
 
-pub const State = dnd_drop.State;
-pub const Item = dnd_drop.State.Item;
-pub const MoveEvent = dnd_drop.State.MoveEvent;
+pub const State = dnd_state.State;
+pub const Event = dnd_state.Event;
+pub const Events = dnd_state.Events;
+pub const handleCommand = dnd_state.handleCommand;
+
+pub const DropTarget = dnd_drop.DropTarget;
+pub const MoveEvent = dnd_drop.MoveEvent;
+pub const DataRequest = dnd_drop.DataRequest;
 pub const max_mime_list_bytes = dnd_drop.max_mime_list_bytes;
-pub const handleCommand = dnd_drop.handleCommand;
-pub const Event = dnd_drop.Event;
+pub const max_requests = dnd_drop.max_requests;
 
 test {
     _ = dnd_command;
     _ = dnd_response;
+    _ = dnd_state;
     _ = dnd_drop;
     _ = @import("dnd_test.zig");
 }
