@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 
 const assert = @import("../../quirks.zig").inlineAssert;
 const osc = @import("../osc.zig");
+const dnd = @import("../dnd.zig");
 const command = @import("dnd_command.zig");
 const response = @import("dnd_response.zig");
 
@@ -227,14 +228,15 @@ pub const DropTarget = struct {
     /// Empty when the client declared none, which is the common case.
     /// The list is only needed to register exotic types with the OS,
     /// such as macOS pasteboard stuff.
-    pub fn registeredMimes(self: *const DropTarget) std.mem.TokenIterator(u8, .scalar) {
-        return std.mem.tokenizeScalar(u8, self.registered_mimes.items, ' ');
+    pub fn registeredMimes(self: *const DropTarget) dnd.MimeList {
+        return .{ .bytes = self.registered_mimes.items };
     }
 
     /// The client's acceptance response for the drag currently over the
     /// terminal, for OS drag feedback. Null when the client hasn't
-    /// responded yet (embedders should fall back to their default,
-    /// typically copy) or `none` when the client rejected the drag.
+    /// responded yet or `none` when the client rejected the drag. Either
+    /// way the drag isn't accepted, as in kitty: a drop the client hasn't
+    /// accepted is never read or concluded, so embedders refuse it.
     pub fn clientAccepted(self: *const DropTarget) ?Operation {
         if (self.accept_in_progress) return null;
         return self.accepted;
@@ -243,9 +245,9 @@ pub const DropTarget = struct {
     /// Iterate the MIME types the client accepted for the current drag,
     /// most preferred first. Empty until the client answered with a
     /// list.
-    pub fn acceptedMimes(self: *const DropTarget) std.mem.TokenIterator(u8, .scalar) {
+    pub fn acceptedMimes(self: *const DropTarget) dnd.MimeList {
         const items = if (self.accept_in_progress) "" else self.accepted_mimes.items;
-        return std.mem.tokenizeScalar(u8, items, 0);
+        return .{ .bytes = items, .separator = 0 };
     }
 
     /// The data request the embedder must serve, if any.

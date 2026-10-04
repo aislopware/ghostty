@@ -14,6 +14,7 @@ const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_dnd = @import("../kitty/dnd.zig");
+const dnd = @import("../dnd.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
 const mouse = @import("../mouse.zig");
@@ -654,7 +655,29 @@ const Effects = struct {
         func(@ptrCast(wrapper), wrapper.effects.userdata, held);
     }
 
-    fn kittyDndTrampoline(handler: *Handler, event: kitty_dnd.Event) void {
+    /// The stream's `drop` effect, turned back into the flat event the C
+    /// API exposes; the C side reads the details from the state, as it
+    /// did before drops carried them.
+    fn kittyDndDropTrampoline(handler: *Handler, event: dnd.DropEvent) void {
+        kittyDndCall(handler, switch (event) {
+            .registration => .registration,
+            .acceptance => .acceptance,
+            .data_request => .data_request,
+            .concluded => |op| switch (op) {
+                .none => .concluded_none,
+                .copy => .concluded_copy,
+                .move => .concluded_move,
+            },
+        });
+    }
+
+    /// The stream's `drag` effect, whose events the C API exposes as they
+    /// are.
+    fn kittyDndDragTrampoline(handler: *Handler, event: kitty_dnd.Event) void {
+        kittyDndCall(handler, event);
+    }
+
+    fn kittyDndCall(handler: *Handler, event: kitty_dnd.Event) void {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.kitty_dnd orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata, event);
@@ -763,7 +786,8 @@ fn wrap(
         .bell = &Effects.bellTrampoline,
         .color_scheme = &Effects.colorSchemeTrampoline,
         .desktop_notification = &Effects.desktopNotificationTrampoline,
-        .drag_and_drop = null,
+        .drop = null,
+        .drag = null,
         .device_attributes = &Effects.deviceAttributesTrampoline,
         .enquiry = &Effects.enquiryTrampoline,
         .xtversion = &Effects.xtversionTrampoline,
@@ -1398,10 +1422,10 @@ fn setTyped(
         },
         .kitty_dnd => {
             wrapper.effects.kitty_dnd = value;
-            wrapper.stream.handler.effects.drag_and_drop = if (value != null)
-                &Effects.kittyDndTrampoline
-            else
-                null;
+            // One C callback takes both directions' events, by value.
+            const on = value != null;
+            wrapper.stream.handler.effects.drop = if (on) &Effects.kittyDndDropTrampoline else null;
+            wrapper.stream.handler.effects.drag = if (on) &Effects.kittyDndDragTrampoline else null;
         },
         .unknown_sequence => {
             wrapper.effects.unknown_sequence = value;

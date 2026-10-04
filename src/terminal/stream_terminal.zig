@@ -19,6 +19,7 @@ const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
 const paste_pkg = @import("paste.zig");
+const dnd = @import("dnd.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
 const kitty_notification = @import("kitty/notification.zig");
 const lib = @import("lib.zig");
@@ -171,20 +172,32 @@ pub const Handler = struct {
         /// valid for the duration of the callback.
         desktop_notification: ?*const fn (*Handler, Action.ShowDesktopNotification) void,
 
-        /// Called when drag and drop protocol state changes in a way the
-        /// embedder may need to act on, such as the running program
-        /// registering to accept drops, requesting dropped data, or
-        /// starting a drag. The event says what changed; the details
-        /// are read from `handler.terminal.kitty_dnd` (Kitty's OSC 72 is
-        /// the only drag and drop protocol today). Native drag events
-        /// flow the other way, by calling `kitty.dnd.State` directly
-        /// and writing to the pty (see `ptyWriter`); that may be done
-        /// from within this callback.
+        /// Called when the running program changes how it takes drops
+        /// onto the terminal in a way the embedder may need to act on,
+        /// such as registering to accept drops, requesting dropped data,
+        /// or concluding a drop. Kitty's OSC 72 is the only drag and drop
+        /// protocol today. Native drag events flow the other way, by
+        /// calling `kitty.dnd.State` (`handler.terminal.kitty_dnd`)
+        /// directly and writing to the pty (see `ptyWriter`); that may be
+        /// done from within this callback.
         ///
-        /// When null, drag and drop needs an embedder to connect it to
-        /// the OS, so OSC 72 is ignored entirely (including queries) and
-        /// programs fall back to their behavior without the protocol.
-        drag_and_drop: ?*const fn (*Handler, kitty_dnd.Event) void,
+        /// When null, drops need an embedder to connect them to the OS,
+        /// so OSC 72 is ignored entirely (including queries) and programs
+        /// fall back to their behavior without the protocol.
+        drop: ?*const fn (*Handler, dnd.DropEvent) void,
+
+        /// Called when the running program changes the drag it offers
+        /// out of the terminal: it enabled or disabled offering drags,
+        /// asked to start its offered drag, changed its image, delivered
+        /// data the embedder requested, or the drag must be canceled.
+        /// The details are read from `handler.terminal.kitty_dnd`'s
+        /// `drag`. Native drag events flow the other way, by calling
+        /// `kitty.dnd.DragSource` directly and writing to the pty (see
+        /// `ptyWriter`); that may be done from within this callback.
+        ///
+        /// OSC 72 is ignored entirely only when both this and `drop` are
+        /// null.
+        drag: ?*const fn (*Handler, kitty_dnd.Event) void,
 
         /// Called in response to a color scheme DSR query (CSI ? 996 n).
         /// Returns the current color scheme. Return null to silently
@@ -316,7 +329,8 @@ pub const Handler = struct {
             .color_scheme = null,
             .desktop_notification = null,
             .device_attributes = null,
-            .drag_and_drop = null,
+            .drag = null,
+            .drop = null,
             .enquiry = null,
             .progress_report = null,
             .reset = null,
@@ -1633,7 +1647,7 @@ pub const Handler = struct {
         self: *Handler,
         v: Action.KittyDnd,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
-        const func = self.effects.drag_and_drop orelse return;
+        if (self.effects.drop == null and self.effects.drag == null) return;
 
         // Responses are usually small (queries, errors), so fall back
         // to the heap only when needed.
@@ -1659,8 +1673,52 @@ pub const Handler = struct {
         }
 
         // Delivered after the responses are written so the effect may
-        // write its own (e.g. serving a data request immediately).
-        for (events.slice()) |ev| func(self, ev);
+        // write its own (e.g. serving a data request immediately). The
+        // details are read from the state as each is delivered, since
+        // an earlier effect call may have changed it.
+        for (events.slice()) |ev| self.kittyDndEvent(ev);
+    }
+
+    /// Deliver one OSC 72 event to the effect for its direction.
+    fn kittyDndEvent(self: *Handler, ev: kitty_dnd.Event) void {
+        switch (ev) {
+            .offers, .drag_start, .drag_image, .drag_data, .drag_cancel => {
+                const func = self.effects.drag orelse return;
+                func(self, ev);
+            },
+            else => self.kittyDndDrop(ev),
+        }
+    }
+
+    fn kittyDndDrop(self: *Handler, ev: kitty_dnd.Event) void {
+        const func = self.effects.drop orelse return;
+        const drop = if (self.terminal.kitty_dnd) |state| &state.drop else null;
+        func(self, switch (ev) {
+            .registration => .{ .registration = if (drop) |d| .{
+                .accepting = d.registered,
+                .mimes = d.registeredMimes(),
+            } else .{ .accepting = false } },
+            .acceptance => .{ .acceptance = .{
+                .operation = dndOperation((drop orelse return).clientAccepted() orelse return),
+                .mimes = drop.?.acceptedMimes(),
+            } },
+            .data_request => .{ .data_request = req: {
+                const r = (drop orelse return).request() orelse return;
+                break :req .{ .id = r.id, .mime_index = r.mime_index, .mime = r.mime };
+            } },
+            .concluded_none => .{ .concluded = .none },
+            .concluded_copy => .{ .concluded = .copy },
+            .concluded_move => .{ .concluded = .move },
+            .offers, .drag_start, .drag_image, .drag_data, .drag_cancel => return,
+        });
+    }
+
+    fn dndOperation(op: kitty_dnd.Operation) dnd.Operation {
+        return switch (op) {
+            .none => .none,
+            .copy => .copy,
+            .move => .move,
+        };
     }
 
     fn reportDeviceAttributes(self: *Handler, req: device_attributes.Req) void {
@@ -6844,10 +6902,10 @@ test "continuation reconstructs standard stream without duplicate effects" {
     );
 }
 
-/// A drag and drop effect for tests that only need OSC 72 processed.
-fn testIgnoreDragAndDrop(_: *Handler, _: kitty_dnd.Event) void {}
+/// A drop effect for tests that only need OSC 72 processed.
+fn testIgnoreDrop(_: *Handler, _: dnd.DropEvent) void {}
 
-test "kitty dnd: ignored without drag and drop effect" {
+test "kitty dnd: ignored without drop effect" {
     const S = struct {
         var pty: std.ArrayListUnmanaged(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
@@ -6890,7 +6948,7 @@ test "kitty dnd: query response" {
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
-    handler.effects.drag_and_drop = &testIgnoreDragAndDrop;
+    handler.effects.drop = &testIgnoreDrop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
@@ -6907,17 +6965,18 @@ test "kitty dnd: register, drop, and serve data from the effect" {
 
         // Serves data requests immediately, from within the effect,
         // as an embedder with synchronous access to the data would.
-        fn dragAndDrop(handler: *Handler, ev: kitty_dnd.Event) void {
+        fn drop(handler: *Handler, ev: dnd.DropEvent) void {
             if (ev != .data_request) return;
-            const drop = &handler.terminal.kitty_dnd.?.drop;
+            const target = &handler.terminal.kitty_dnd.?.drop;
             var buf: [64]u8 = undefined;
             var pty_writer = handler.ptyWriter(&buf);
             defer pty_writer.writer.flush() catch unreachable;
-            var req = drop.request();
-            while (req) |r| {
-                testing.expectEqualStrings("text/plain", r.mime) catch unreachable;
-                drop.respondData(&pty_writer.writer, r.id, "hello") catch unreachable;
-                req = drop.respondEnd(&pty_writer.writer, r.id) catch unreachable;
+            testing.expectEqualStrings("text/plain", ev.data_request.mime) catch unreachable;
+            var id: ?u32 = ev.data_request.id;
+            while (id) |i| {
+                target.respondData(&pty_writer.writer, i, "hello") catch unreachable;
+                const next = target.respondEnd(&pty_writer.writer, i) catch unreachable;
+                id = if (next) |r| r.id else null;
             }
         }
     };
@@ -6929,7 +6988,7 @@ test "kitty dnd: register, drop, and serve data from the effect" {
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
-    handler.effects.drag_and_drop = &S.dragAndDrop;
+    handler.effects.drop = &S.drop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
@@ -6971,12 +7030,51 @@ test "kitty dnd: register, drop, and serve data from the effect" {
     try testing.expect(!t.kitty_dnd.?.drop.dropped);
 }
 
+test "kitty dnd: drag events go to the drag effect, drop events to the drop effect" {
+    const S = struct {
+        var drags: std.ArrayListUnmanaged(kitty_dnd.Event) = .empty;
+        var drops: std.ArrayListUnmanaged(std.meta.Tag(dnd.DropEvent)) = .empty;
+
+        fn drag(_: *Handler, ev: kitty_dnd.Event) void {
+            drags.append(testing.allocator, ev) catch unreachable;
+        }
+
+        fn drop(_: *Handler, ev: dnd.DropEvent) void {
+            drops.append(testing.allocator, ev) catch unreachable;
+        }
+    };
+    S.drags = .empty;
+    S.drops = .empty;
+    defer S.drags.deinit(testing.allocator);
+    defer S.drops.deinit(testing.allocator);
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    // A drag effect alone is enough for OSC 72 to be processed.
+    var handler: Handler = .init(&t);
+    handler.effects.drag = &S.drag;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]72;t=o:x=1\x1B\\");
+    s.nextSlice("\x1B]72;t=a;text/plain\x1B\\");
+    try testing.expectEqualSlices(kitty_dnd.Event, &.{.offers}, S.drags.items);
+    try testing.expectEqual(@as(usize, 0), S.drops.items.len);
+
+    s.handler.effects.drop = &S.drop;
+    s.nextSlice("\x1B]72;t=a\x1B\\");
+    s.nextSlice("\x1B]72;t=o:x=2\x1B\\");
+    try testing.expectEqualSlices(kitty_dnd.Event, &.{ .offers, .offers }, S.drags.items);
+    try testing.expectEqualSlices(std.meta.Tag(dnd.DropEvent), &.{.registration}, S.drops.items);
+}
+
 test "kitty dnd: state updates work without write_pty effect" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
     var handler: Handler = .init(&t);
-    handler.effects.drag_and_drop = &testIgnoreDragAndDrop;
+    handler.effects.drop = &testIgnoreDrop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
@@ -7008,7 +7106,7 @@ test "kitty dnd: registration survives terminal reset" {
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
-    handler.effects.drag_and_drop = &testIgnoreDragAndDrop;
+    handler.effects.drop = &testIgnoreDrop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
@@ -7027,7 +7125,7 @@ test "kitty dnd: registration survives terminal reset" {
 
 test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     const S = struct {
-        var events: std.ArrayListUnmanaged(kitty_dnd.Event) = .empty;
+        var events: std.ArrayListUnmanaged(std.meta.Tag(dnd.DropEvent)) = .empty;
         var mimes: std.ArrayListUnmanaged(u8) = .empty;
 
         fn clear() void {
@@ -7037,17 +7135,24 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
             mimes = .empty;
         }
 
-        fn dragAndDrop(handler: *Handler, ev: kitty_dnd.Event) void {
+        var operation: dnd.Operation = .none;
+
+        fn drop(_: *Handler, ev: dnd.DropEvent) void {
             events.append(testing.allocator, ev) catch unreachable;
-            // Registration details are read from the terminal state.
-            if (ev == .registration) {
-                mimes.clearRetainingCapacity();
-                const state = handler.terminal.kitty_dnd orelse return;
-                var it = state.drop.registeredMimes();
-                while (it.next()) |m| {
-                    mimes.appendSlice(testing.allocator, m) catch unreachable;
-                    mimes.append(testing.allocator, ',') catch unreachable;
-                }
+            const list = switch (ev) {
+                .registration => |r| r.mimes,
+                .acceptance => |a| a.mimes,
+                .concluded => |op| {
+                    operation = op;
+                    return;
+                },
+                .data_request => return,
+            };
+            mimes.clearRetainingCapacity();
+            var it = list.iterator();
+            while (it.next()) |m| {
+                mimes.appendSlice(testing.allocator, m) catch unreachable;
+                mimes.append(testing.allocator, ',') catch unreachable;
             }
         }
     };
@@ -7058,11 +7163,11 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     defer t.deinit(testing.allocator);
 
     var handler: Handler = .init(&t);
-    handler.effects.drag_and_drop = &S.dragAndDrop;
+    handler.effects.drop = &S.drop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
-    // Registration with a MIME list, read back from the state.
+    // Registration with a MIME list.
     s.nextSlice("\x1B]72;t=a;image/png text/plain\x1B\\");
     try testing.expectEqual(@as(usize, 1), S.events.items.len);
     try testing.expect(S.events.items[0] == .registration);
@@ -7083,13 +7188,15 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     s.nextSlice("\x1B]72;t=m:o=2;text/plain\x1B\\");
     try testing.expectEqual(@as(usize, 2), S.events.items.len);
     try testing.expect(S.events.items[1] == .acceptance);
+    try testing.expectEqualStrings("text/plain,", S.mimes.items);
 
     // Conclusion carries the performed operation.
     s.nextSlice("\x1B]72;t=r:o=2\x1B\\");
     try testing.expectEqual(@as(usize, 3), S.events.items.len);
-    try testing.expectEqual(kitty_dnd.Event.concluded_move, S.events.items[2]);
+    try testing.expect(S.events.items[2] == .concluded);
+    try testing.expectEqual(dnd.Operation.move, S.operation);
 
-    // Unregistration reports with the state gone.
+    // Unregistration reports with no MIME types.
     s.nextSlice("\x1B]72;t=A\x1B\\");
     try testing.expectEqual(@as(usize, 4), S.events.items.len);
     try testing.expect(S.events.items[3] == .registration);

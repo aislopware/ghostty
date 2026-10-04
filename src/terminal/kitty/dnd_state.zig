@@ -17,9 +17,11 @@ const Operation = command.Operation;
 const log = std.log.scoped(.kitty_dnd);
 
 /// A protocol state change an embedder may need to act on, returned by
-/// `handleCommand` and delivered through the stream handler's
-/// `drag_and_drop` effect. This is a flat enum so it can cross a C API
-/// unchanged; any details are read back from `Terminal.kitty_dnd`.
+/// `handleCommand`. The stream handler delivers the drop events as a
+/// protocol independent `dnd.DropEvent` through its `drop` effect, with
+/// their details read from the state, and the drag events as they are
+/// through its `drag` effect. This is a flat enum so it can cross a C
+/// API unchanged; any details are read back from `Terminal.kitty_dnd`.
 ///
 /// Values are only ever appended: the C API exposes them by value.
 pub const Event = enum(c_int) {

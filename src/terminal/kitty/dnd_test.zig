@@ -132,7 +132,7 @@ test "dnd: register and unregister" {
     try h.expectEvents("t=a", "text/plain text/uri-list", &.{.registration});
     try h.expectOutput("");
     {
-        var it = h.drop().registeredMimes();
+        var it = h.drop().registeredMimes().iterator();
         try testing.expectEqualStrings("text/plain", it.next().?);
         try testing.expectEqualStrings("text/uri-list", it.next().?);
         try testing.expect(it.next() == null);
@@ -146,7 +146,7 @@ test "dnd: register and unregister" {
     // Re-registration replaces the list.
     try h.expectEvents("t=a", "image/png", &.{.registration});
     {
-        var it = h.drop().registeredMimes();
+        var it = h.drop().registeredMimes().iterator();
         try testing.expectEqualStrings("image/png", it.next().?);
         try testing.expect(it.next() == null);
     }
@@ -154,7 +154,7 @@ test "dnd: register and unregister" {
     // Registering without a list is the common case.
     try h.expectEvents("t=a", null, &.{.registration});
     {
-        var it = h.drop().registeredMimes();
+        var it = h.drop().registeredMimes().iterator();
         try testing.expect(it.next() == null);
     }
 
@@ -294,7 +294,7 @@ test "dnd: chunked client acceptance" {
         "text/plain\x00text/html\x00",
         h.drop().accepted_mimes.items,
     );
-    var it = h.drop().acceptedMimes();
+    var it = h.drop().acceptedMimes().iterator();
     try testing.expectEqualStrings("text/plain", it.next().?);
     try testing.expectEqualStrings("text/html", it.next().?);
     try testing.expect(it.next() == null);
@@ -596,7 +596,7 @@ test "dnd: chunked registration reuses first chunk metadata" {
     try h.expectOutput("");
     try testing.expectEqual(@as(u32, 4), h.drop().client_id);
     {
-        var it = h.drop().registeredMimes();
+        var it = h.drop().registeredMimes().iterator();
         try testing.expectEqualStrings("text/plain", it.next().?);
     }
 
@@ -738,7 +738,7 @@ test "dnd: over-cap registration list never completes" {
     try h.expectEvents("t=a", big, &.{});
     try testing.expect(h.state != null);
     {
-        var it = h.drop().registeredMimes();
+        var it = h.drop().registeredMimes().iterator();
         try testing.expect(it.next() == null);
     }
 }
