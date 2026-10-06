@@ -386,6 +386,7 @@ pub const StreamHandler = struct {
             .kitty_dnd,
             .kitty_desktop_notification,
             .osc_unknown,
+            .program_status,
             => {},
         }
     }
