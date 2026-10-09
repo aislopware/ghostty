@@ -121,6 +121,7 @@ drepper
 dungdm93
 dzhlobo
 ekaterinepapava
+ekusiadadus
 elias8
 elitex45
 -enkr1
@@ -162,6 +163,7 @@ helium777
 hlcfan
 howdeploy
 hqnna
+huge
 hulet
 i999rri
 ibaios
@@ -193,6 +195,7 @@ kataokatsuki
 kawarimidoll
 kayleung
 kenvandine
+kgni
 khipp
 kierancanter
 kirwiisp
@@ -302,11 +305,13 @@ qwerasd205
 radicaltray
 ragnoroct
 raphamorim
+rayzerrek
 reo101
 rewdy
 rgehan
 rhodes-b
 rightaditya
+-riskirills66 Demonstrated indefensibly poor taste, judgement and AI steering capabilities
 rjwittams
 rkoten
 rmengelbrecht

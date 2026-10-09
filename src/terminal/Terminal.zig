@@ -86,8 +86,8 @@ modes: modespkg.ModeState = .{},
 /// Terminal-level cursor state.
 cursor: Cursor = .{},
 
-/// The checksum variant DECRQCRA computes after RIS. The current variant
-/// is in `flags.xt_checksum`.
+/// The checksum variant DECRQCRA computes after RIS or DECSTR. The current
+/// variant is in `flags.xt_checksum`.
 default_xt_checksum: xt_checksum.Flags = .{},
 
 /// The most recently set mouse shape for the terminal.
@@ -275,11 +275,11 @@ pub const Cursor = struct {
     /// Whether the current cursor appearance follows the configured defaults.
     is_default: bool = true,
 
-    /// Configured style restored by DECSCUSR default and RIS.
+    /// Configured style restored by DECSCUSR default, RIS and DECSTR.
     default_style: Screen.CursorStyle = .block,
 
-    /// Configured blink restored by DECSCUSR default and RIS. Null selects
-    /// the terminal emulator default, which is blinking.
+    /// Configured blink restored by DECSCUSR default, RIS and DECSTR.
+    /// Null selects the terminal emulator default, which is blinking.
     default_blink: ?bool = false,
 };
 
@@ -302,7 +302,7 @@ pub const Options = struct {
     /// will revert back to this state.
     default_modes: modespkg.ModePacked = .{},
 
-    /// Cursor state restored by DECSCUSR default and RIS.
+    /// Cursor state restored by DECSCUSR default, RIS and DECSTR.
     default_cursor_style: Screen.CursorStyle = .block,
     default_cursor_blink: ?bool = false,
 
@@ -310,7 +310,7 @@ pub const Options = struct {
     /// prompt says otherwise, restored by RIS. See `flags.shell_redraws_prompt`.
     default_prompt_redraw: osc.semantic_prompt.Redraw = .true,
 
-    /// The checksum variant DECRQCRA computes after RIS.
+    /// The checksum variant DECRQCRA computes after RIS or DECSTR.
     default_xt_checksum: xt_checksum.Flags = .{},
 
     /// The total storage limit for Kitty images in bytes. Has no effect
@@ -421,8 +421,8 @@ pub fn vtHandler(self: *Terminal) Stream.Handler {
     return .init(self);
 }
 
-/// Set the checksum variant restored by RIS. Like `ModeState.setDefault`,
-/// this also changes the current variant.
+/// Set the checksum variant restored by RIS and DECSTR. Like
+/// `ModeState.setDefault`, this also changes the current variant.
 pub fn setDefaultXtChecksum(self: *Terminal, flags: xt_checksum.Flags) void {
     self.default_xt_checksum = flags;
     self.flags.xt_checksum = flags;
@@ -1275,6 +1275,17 @@ pub fn print(self: *Terminal, c: u21) !void {
     // that our screen remains in a consistent state.
     defer self.screens.active.assertIntegrity();
 
+    // The charset this character is printed with. A single shift applies to
+    // exactly one character, so it is used up here, whether the character
+    // takes a cell or attaches to the previous one: xterm clears it for a
+    // combining character and so do we.
+    const charset: charsets.Charset = charset: {
+        const state = &self.screens.active.charset;
+        const key = state.single_shift orelse state.gl;
+        state.single_shift = null;
+        break :charset state.charsets.get(key);
+    };
+
     // Our right margin depends where our cursor is now.
     const right_limit = if (self.screens.active.cursor.x > self.scrolling_region.right)
         self.cols
@@ -1384,7 +1395,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                             prev.cell.content.codepoint.data = 0;
 
                             try self.printWrap();
-                            self.printCell(prev_cp, .wide);
+                            self.writeCell(prev_cp, .wide);
 
                             const new_pin = self.screens.active.cursor.page_pin.*;
                             const new_rac = new_pin.rowAndCell();
@@ -1421,12 +1432,12 @@ pub fn print(self: *Terminal, c: u21) !void {
                             // we'll be appending graphemes to
                             prev.cell = self.screens.active.cursor.page_cell;
                         } else {
-                            self.printCell(
+                            self.writeCell(
                                 0,
                                 if (row_wrap) .spacer_head else .narrow,
                             );
                             try self.printWrap();
-                            self.printCell(prev_cp, .wide);
+                            self.writeCell(prev_cp, .wide);
 
                             // Point prev.cell to our new previous cell that
                             // we'll be appending graphemes to
@@ -1450,7 +1461,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                     const spacer_node = self.screens.active.cursor.page_pin.node;
                     const spacer_serial = spacer_node.serial;
 
-                    self.printCell(0, .spacer_tail);
+                    self.writeCell(0, .spacer_tail);
 
                     if (self.screens.active.cursor.page_pin.node != spacer_node or
                         self.screens.active.cursor.page_pin.node.serial != spacer_serial)
@@ -1591,7 +1602,7 @@ pub fn print(self: *Terminal, c: u21) !void {
         1 => {
             @branchHint(.likely);
             self.screens.active.cursorMarkDirty();
-            @call(.always_inline, printCell, .{ self, c, .narrow });
+            @call(.always_inline, printCell, .{ self, c, .narrow, charset });
         },
 
         // Wide character requires a spacer. We print this by
@@ -1617,22 +1628,22 @@ pub fn print(self: *Terminal, c: u21) !void {
                     // a page resize during printCell then it'll fail
                     // integrity checks.
                     self.screens.active.cursor.page_row.wrap = true;
-                    self.printCell(0, .spacer_head);
+                    self.writeCell(0, .spacer_head);
                 } else {
-                    self.printCell(0, .narrow);
+                    self.writeCell(0, .narrow);
                 }
                 try self.printWrap();
             }
 
             self.screens.active.cursorMarkDirty();
-            self.printCell(c, .wide);
+            self.printCell(c, .wide, charset);
             self.screens.active.cursorRight(1);
-            self.printCell(0, .spacer_tail);
+            self.writeCell(0, .spacer_tail);
         } else {
             // This is pretty broken, terminals should never be only 1-wide.
             // We should prevent this downstream.
             self.screens.active.cursorMarkDirty();
-            self.printCell(0, .narrow);
+            self.writeCell(0, .narrow);
         },
 
         else => unreachable,
@@ -1649,25 +1660,17 @@ pub fn print(self: *Terminal, c: u21) !void {
     self.screens.active.cursorRight(1);
 }
 
+/// Prints the character unmapped_c into the cell under the cursor, mapped
+/// through set, the charset print chose for it. Spacers and cells that
+/// already hold a mapped character are written with writeCell instead.
 fn printCell(
     self: *Terminal,
     unmapped_c: u21,
     wide: Cell.Wide,
+    set: charsets.Charset,
 ) void {
-    defer self.screens.active.assertIntegrity();
-
-    // TODO: spacers should use a bgcolor only cell
-
     const c: u21 = c: {
         // TODO: non-utf8 handling, gr
-
-        // If we're single shifting, then we use the key exactly once.
-        const key = if (self.screens.active.charset.single_shift) |key_once| blk: {
-            self.screens.active.charset.single_shift = null;
-            break :blk key_once;
-        } else self.screens.active.charset.gl;
-
-        const set = self.screens.active.charset.charsets.get(key);
 
         // UTF-8 or ASCII is used as-is
         if (set == .utf8 or set == .ascii) {
@@ -1684,6 +1687,19 @@ fn printCell(
         const table = charsets.table(set);
         break :c @intCast(table[@intCast(unmapped_c)]);
     };
+
+    @call(.always_inline, writeCell, .{ self, c, wide });
+}
+
+/// Writes c into the cell under the cursor as it is, without a charset.
+fn writeCell(
+    self: *Terminal,
+    c: u21,
+    wide: Cell.Wide,
+) void {
+    defer self.screens.active.assertIntegrity();
+
+    // TODO: spacers should use a bgcolor only cell
 
     const cell = self.screens.active.cursor.page_cell;
 
@@ -5166,6 +5182,56 @@ pub fn fullReset(self: *Terminal) void {
     self.flags.dirty.clear = true;
 }
 
+/// DECSTR - Soft Terminal Reset. Resets the modes and state a program may
+/// have left behind, without clearing the screen or moving the cursor.
+/// Beyond what the VT510 manual lists, this also resets what xterm's soft
+/// reset does: left and right margins, the cursor style, the color palette,
+/// modifyOtherKeys, and the XTCHECKSUM variant.
+pub fn softReset(self: *Terminal) void {
+    const reset_modes = [_]modespkg.Mode{
+        .cursor_visible,
+        .insert,
+        .origin,
+        .wraparound,
+        .reverse_wrap,
+        .reverse_wrap_extended,
+        .disable_keyboard,
+        .cursor_keys,
+        .keypad_keys,
+        .enable_left_and_right_margin,
+    };
+    for (reset_modes) |mode| self.modes.set(mode, self.modes.getDefault(mode));
+
+    self.scrolling_region = .{
+        .top = 0,
+        .bottom = self.rows - 1,
+        .left = 0,
+        .right = self.cols - 1,
+    };
+
+    // The default style needs no allocation so this can't fail.
+    const screen: *Screen = self.screens.active;
+    screen.cursor.style = .{};
+    screen.manualStyleUpdate() catch unreachable;
+    screen.cursor.protected = false;
+    screen.charset = .{};
+
+    // A saved cursor now restores to the home position with the defaults.
+    screen.saved_cursor = null;
+
+    self.status_display = .main;
+    self.flags.modify_other_keys_2 = false;
+    self.flags.xt_checksum = self.default_xt_checksum;
+    self.setCursorStyle(.default);
+
+    // xterm resets the palette for DECSTR as well as RIS, as OSC 104
+    // with no arguments would. Dynamic colors (OSC 10-19) are kept.
+    if (self.colors.palette.mask.count() > 0) {
+        self.colors.palette.resetAll();
+        self.flags.dirty.palette = true;
+    }
+}
+
 /// Returns true if the point is dirty, used for testing.
 fn isDirty(t: *const Terminal, pt: point.Point) bool {
     return t.screens.active.pages.getCell(pt).?.isDirty();
@@ -7259,6 +7325,45 @@ test "Terminal: print wide codepoint in a charset prints it unmapped" {
     }
 }
 
+test "Terminal: print single shift is used up by a combining character" {
+    // As in xterm, the single shift applies to the combining mark, the next
+    // character printed, whether or not it clusters with the one before.
+    for ([_]bool{ false, true }) |cluster| {
+        var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 2 });
+        defer t.deinit(testing.allocator);
+        t.modes.set(.grapheme_cluster, cluster);
+
+        t.configureCharset(.G2, .british);
+        try t.print('#');
+        t.invokeCharset(.GL, .G2, true);
+        try t.print(0x0301);
+        try testing.expectEqual(null, t.screens.active.charset.single_shift);
+        try t.print('#');
+
+        try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+        const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?.cell;
+        try testing.expectEqual(@as(u21, '#'), cell.codepoint());
+    }
+}
+
+test "Terminal: VS16 moving a character to the next line keeps it unmapped" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 3, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    // The '#' is printed with ASCII in the last column. VS16 widens it after
+    // the British set (which maps '#' to '£') is selected, which moves it to
+    // the next line: it is the same character, not one to map again.
+    t.modes.set(.grapheme_cluster, true);
+    t.cursorRight(2);
+    try t.print('#');
+    t.configureCharset(.G0, .british);
+    try t.print(0xFE0F);
+
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?.cell;
+    try testing.expectEqual(@as(u21, '#'), cell.codepoint());
+    try testing.expectEqual(.wide, cell.wide);
+}
+
 test "Terminal: print invoke charset" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 80 });
     defer t.deinit(testing.allocator);
@@ -7732,7 +7837,7 @@ test "Terminal: overwrite hyperlink" {
 }
 
 // Printing a wide char at the right edge with an active hyperlink causes
-// printCell to write a spacer_head before printWrap sets the row wrap
+// writeCell to write a spacer_head before printWrap sets the row wrap
 // flag. The integrity check inside setHyperlink (or increaseCapacity)
 // sees the unwrapped spacer head and panics. Found via fuzzing.
 test "Terminal: print wide char at right edge with hyperlink" {
@@ -7744,7 +7849,7 @@ test "Terminal: print wide char at right edge with hyperlink" {
     // Move cursor to the last column (1-indexed)
     t.setCursorPos(1, 10);
 
-    // Print a wide character; this will call printCell(0, .spacer_head)
+    // Print a wide character; this will call writeCell(0, .spacer_head)
     // at the right edge before calling printWrap, triggering the
     // integrity violation.
     try t.print(0x4E2D); // U+4E2D '中'
@@ -16287,6 +16392,130 @@ test "Terminal: default xt checksum survives resets" {
     try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
     t.fullReset();
     try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+
+    t.flags.xt_checksum = .{ .full = true };
+    t.softReset();
+    try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+}
+
+test "Terminal: softReset modes" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.insert, true);
+    t.modes.set(.origin, true);
+    t.modes.set(.wraparound, false);
+    t.modes.set(.reverse_wrap, true);
+    t.modes.set(.cursor_visible, false);
+    t.modes.set(.cursor_keys, true);
+    t.modes.set(.keypad_keys, true);
+    t.modes.set(.bracketed_paste, true);
+    t.softReset();
+
+    try testing.expect(!t.modes.get(.insert));
+    try testing.expect(!t.modes.get(.origin));
+    try testing.expect(t.modes.get(.wraparound));
+    try testing.expect(!t.modes.get(.reverse_wrap));
+    try testing.expect(t.modes.get(.cursor_visible));
+    try testing.expect(!t.modes.get(.cursor_keys));
+    try testing.expect(!t.modes.get(.keypad_keys));
+
+    // Modes DECSTR doesn't cover are left alone.
+    try testing.expect(t.modes.get(.bracketed_paste));
+}
+
+test "Terminal: softReset margins" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(3, 4);
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(5, 6);
+    t.softReset();
+
+    try testing.expect(!t.modes.get(.enable_left_and_right_margin));
+    try testing.expectEqual(ScrollingRegion{
+        .top = 0,
+        .bottom = 9,
+        .left = 0,
+        .right = 9,
+    }, t.scrolling_region);
+}
+
+test "Terminal: softReset keeps the cursor and screen" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.printString("hello");
+    t.setCursorPos(6, 5);
+    t.softReset();
+
+    try testing.expectEqual(4, t.screens.active.cursor.x);
+    try testing.expectEqual(5, t.screens.active.cursor.y);
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("hello", str);
+}
+
+test "Terminal: softReset saved cursor" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorPos(6, 5);
+    try t.setAttribute(.bold);
+    t.saveCursor();
+    t.softReset();
+    t.restoreCursor();
+
+    try testing.expectEqual(0, t.screens.active.cursor.x);
+    try testing.expectEqual(0, t.screens.active.cursor.y);
+    try testing.expect(!t.screens.active.cursor.style.flags.bold);
+}
+
+test "Terminal: softReset pen, protection, and charsets" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.setAttribute(.bold);
+    t.setProtectedMode(.dec);
+    t.configureCharset(.G0, .dec_special);
+    t.softReset();
+
+    try testing.expectEqual(@as(style.Id, 0), t.screens.active.cursor.style_id);
+    try testing.expect(!t.screens.active.cursor.protected);
+    try testing.expectEqual(charsets.Charset.utf8, t.screens.active.charset.charsets.get(.G0));
+}
+
+test "Terminal: softReset status display and checksum" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.status_display = .status_line;
+    t.flags.xt_checksum = .{ .positive = true };
+    t.softReset();
+
+    try testing.expectEqual(.main, t.status_display);
+    try testing.expectEqual(xt_checksum.Flags{}, t.flags.xt_checksum);
+}
+
+test "Terminal: softReset palette" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Nothing changed, so nothing is redrawn.
+    t.softReset();
+    try testing.expect(!t.flags.dirty.palette);
+
+    const red: color.RGB = .{ .r = 0xff, .g = 0, .b = 0 };
+    t.colors.palette.set(1, red);
+    t.colors.palette.set(200, red);
+    t.softReset();
+
+    try testing.expect(t.flags.dirty.palette);
+    try testing.expectEqual(0, t.colors.palette.mask.count());
+    try testing.expectEqual(color.default[1], t.colors.palette.current[1]);
+    try testing.expectEqual(color.default[200], t.colors.palette.current[200]);
 }
 
 // https://github.com/mitchellh/ghostty/issues/272

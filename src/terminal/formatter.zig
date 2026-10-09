@@ -581,6 +581,21 @@ pub const TerminalFormatter = struct {
         // cursor last.
         screen_formatter.content = .none;
         screen_formatter.extra = self.extra.screen;
+
+        // In origin mode (DECOM), which the modes above restore, CUP counts
+        // from the top-left of the scrolling region restored above, so the
+        // cursor position is written relative to it.
+        if (self.opts.emit == .vt and
+            self.extra.modes and
+            self.extra.scrolling_region and
+            self.terminal.modes.get(.origin))
+        {
+            screen_formatter.cursor_origin = .{
+                .x = self.terminal.scrolling_region.left,
+                .y = self.terminal.scrolling_region.top,
+            };
+        }
+
         try screen_formatter.format(writer);
     }
 };
@@ -614,11 +629,16 @@ pub const ScreenFormatter = struct {
 
     /// The terminal the screen belongs to, when it is known. The cursor
     /// extra needs it for the state the terminal rather than the screen
-    /// keeps: the margins origin mode addresses the cursor within, and the
-    /// cursor's shape and blink. Without it, the cursor is addressed from
-    /// the top left of the screen and neither its shape nor its saved state
-    /// is emitted.
+    /// keeps: the right margin a pending wrap sits at, and the cursor's
+    /// shape and saved state. Without it, a pending wrap sits at the last
+    /// column and neither the shape nor the saved state is emitted.
     terminal: ?*const Terminal = null,
+
+    /// The point the emitted cursor position (CUP) counts from, when the
+    /// output is replayed in origin mode (DECOM): the top-left of the
+    /// scrolling region. Null when CUP counts from the top-left of the
+    /// screen.
+    cursor_origin: ?CursorOrigin = null,
 
     pub const Content = union(enum) {
         /// Emit no content, only terminal state such as modes, palette, etc.
@@ -628,6 +648,11 @@ pub const ScreenFormatter = struct {
         /// Emit the content specified by the selection. Null for all.
         /// The selection is inclusive on both ends.
         selection: ?Selection,
+    };
+
+    pub const CursorOrigin = struct {
+        x: size.CellCountInt = 0,
+        y: size.CellCountInt = 0,
     };
 
     pub const Extra = packed struct {
@@ -751,8 +776,7 @@ pub const ScreenFormatter = struct {
                 if (self.screen.saved_cursor) |saved| try self.formatSavedCursor(t, saved, writer);
             }
             const cursor = &self.screen.cursor;
-            const origin = if (self.terminal) |t| t.modes.get(.origin) else false;
-            try self.formatCursorAt(writer, cursor.x, cursor.y, cursor.pending_wrap, origin);
+            try self.formatCursorAt(writer, cursor.x, cursor.y, cursor.pending_wrap, self.cursor_origin);
         }
 
         // Emit current SGR style state
@@ -844,15 +868,9 @@ pub const ScreenFormatter = struct {
         x: size.CellCountInt,
         y: size.CellCountInt,
         pending_wrap: bool,
-        origin_mode: bool,
+        origin_mode: ?CursorOrigin,
     ) std.Io.Writer.Error!void {
-        const origin: struct { x: size.CellCountInt, y: size.CellCountInt } = if (self.terminal) |t|
-            if (origin_mode)
-                .{ .x = t.scrolling_region.left, .y = t.scrolling_region.top }
-            else
-                .{ .x = 0, .y = 0 }
-        else
-            .{ .x = 0, .y = 0 };
+        const origin = origin_mode orelse CursorOrigin{};
 
         // The column a print leaves a pending wrap in: the right margin,
         // or past it the last column, as `Terminal.print` reads it. The
@@ -885,7 +903,7 @@ pub const ScreenFormatter = struct {
         const rac = pin.rowAndCell();
         const primed = self.opts.emit == .vt and self.opts.semantic_prompt and
             rac.cell.semantic_content == .prompt and rac.row.semantic_prompt == .none and
-            try self.primePrompt(writer, origin_mode);
+            try self.primePrompt(writer, origin_mode != null);
 
         // Move cursor to the edge.
         try writer.print(
@@ -980,7 +998,10 @@ pub const ScreenFormatter = struct {
             @min(saved.x, self.screen.pages.cols - 1),
             @min(saved.y, self.screen.pages.rows - 1),
             saved.pending_wrap,
-            saved.origin,
+            if (saved.origin) .{
+                .x = t.scrolling_region.left,
+                .y = t.scrolling_region.top,
+            } else null,
         );
         try writer.print("{f}", .{saved.style.formatterVt()});
         if (saved.protected) try writer.writeAll("\x1b[1\"q");
@@ -7029,6 +7050,73 @@ test "Terminal vt with scrolling region" {
     try testing.expectEqual(t.scrolling_region.bottom, t2.scrolling_region.bottom);
     try testing.expectEqual(t.scrolling_region.left, t2.scrolling_region.left);
     try testing.expectEqual(t.scrolling_region.right, t2.scrolling_region.right);
+}
+
+test "Terminal vt with cursor in origin mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Each stream sets a scrolling region and origin mode, then moves
+    // the cursor within the region; the last one leaves a pending wrap
+    // in the right column, which is restored by printing that cell again.
+    // The left and right margins need mode 69.
+    const streams = [_][]const u8{
+        "\x1b[3;8r\x1b[?6h\x1b[2;5H",
+        "\x1b[?69h\x1b[3;8r\x1b[4;15s\x1b[?6h\x1b[2;3H",
+        "\x1b[3;8r\x1b[?6h\x1b[2;20Hx",
+    };
+    for (streams) |stream| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+
+        var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 10 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(stream);
+
+        var formatter: TerminalFormatter = .init(&t, .vt);
+        formatter.extra = .all;
+        try formatter.format(&builder.writer);
+
+        var t2 = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 10 });
+        defer t2.deinit(alloc);
+        var s2 = t2.vtStream();
+        defer s2.deinit();
+        s2.nextSlice(builder.writer.buffered());
+
+        try testing.expect(t2.modes.get(.origin));
+        try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+        try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+        try testing.expectEqual(
+            t.screens.active.cursor.pending_wrap,
+            t2.screens.active.cursor.pending_wrap,
+        );
+    }
+}
+
+test "Terminal vt with cursor in origin mode without the region" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 10 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[3;8r\x1b[?6h\x1b[2;5H");
+
+    // Without the scrolling region in the output, the replaying terminal
+    // keeps full-screen margins, so the position stays absolute.
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .all;
+    formatter.extra.scrolling_region = false;
+    try formatter.format(&builder.writer);
+    try testing.expect(std.mem.indexOf(u8, builder.writer.buffered(), "\x1b[4;5H") != null);
 }
 
 test "Terminal vt with modes" {
