@@ -41,7 +41,7 @@ const assert = @import("../../quirks.zig").inlineAssert;
 
 const Handler = @import("../stream_terminal.zig").Handler;
 
-const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
+const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.Io.Dir.max_path_bytes;
 
 const log = std.log.scoped(.terminal_c);
 
@@ -5185,7 +5185,7 @@ test "set program_status callback" {
         var last_title_len: usize = 0;
         var last_message: [64]u8 = undefined;
         var last_message_len: usize = 0;
-        var written: [64]u8 = undefined;
+        var written: [128]u8 = undefined;
         var written_len: usize = 0;
 
         fn programStatus(
@@ -5238,9 +5238,14 @@ test "set program_status callback" {
         @ptrCast(&S.programStatus),
     ));
 
-    // With the callback, it is.
+    // With the callback, it is answered with the states and kinds we
+    // accept and the same terminator.
     vt_write(t, query, query.len);
-    try testing.expectEqualStrings(query, S.written[0..S.written_len]);
+    try testing.expectEqualStrings(
+        "\x1B]7501;?:states=idle,working,done,blocked,error" ++
+            ":kinds=permission,question,auth\x1B\\",
+        S.written[0..S.written_len],
+    );
     try testing.expectEqual(@as(usize, 0), S.count);
 
     // "Plan" and "Apply?"

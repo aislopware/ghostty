@@ -230,6 +230,7 @@ markdorison
 markhuot
 marler8997
 marrocco-simone
+-martzcode Repeated meatproxying in spite of prior warning
 masterflitzer
 matkotiric
 mattn
@@ -306,6 +307,7 @@ radicaltray
 ragnoroct
 raphamorim
 rayzerrek
+-rebecca-bell-2001 automated vomit
 reo101
 rewdy
 rgehan
