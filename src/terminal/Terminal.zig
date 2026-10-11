@@ -2801,11 +2801,17 @@ pub const ScrollViewport = union(Tag) {
     /// This is the same row space as PageList.Scrollbar offset.
     row: usize,
 
+    /// Scroll by a number of prompts relative to the viewport top, up is negative.
+    /// Zero or no matching prompt is a no-op. Moving forward through a final
+    /// prompt continuation can snap to the active area.
+    delta_prompt: isize,
+
     pub const Tag = lib.Enum(lib.target, &.{
         "top",
         "bottom",
         "delta",
         "row",
+        "delta_prompt",
     });
 
     const c_union = lib.TaggedUnion(
@@ -2827,6 +2833,7 @@ pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
         .bottom => .{ .active = {} },
         .delta => |delta| .{ .delta_row = delta },
         .row => |row| .{ .row = row },
+        .delta_prompt => |delta| .{ .delta_prompt = delta },
     });
 }
 

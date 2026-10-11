@@ -319,6 +319,18 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * GHOSTTY_TERMINAL_DATA_SCROLLBAR round-trips cleanly.
    */
   GHOSTTY_SCROLL_VIEWPORT_ROW,
+
+  /**
+   * Scroll by a number of prompts relative to the viewport top. Negative
+   * values move backward and positive values move forward. Requires semantic
+   * prompt markers from the shell. Zero or no matching prompt is a no-op.
+   * If fewer prompts remain than requested, move to the last matching prompt,
+   * clamped to the active area.
+   *
+   * Moving forward through a final prompt continuation can snap to the active
+   * area even when there is no newer prompt.
+   */
+  GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT,
   GHOSTTY_SCROLL_VIEWPORT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalScrollViewportTag;
 
@@ -333,6 +345,9 @@ typedef union {
 
   /** Absolute row offset (only used with GHOSTTY_SCROLL_VIEWPORT_ROW). */
   size_t row;
+
+  /** Prompt delta (only used with GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT). */
+  intptr_t delta_prompt;
 
   /** Padding for ABI compatibility. Do not use. */
   uint64_t _padding[2];
@@ -3193,7 +3208,10 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
  * for up, positive for down). When using GHOSTTY_SCROLL_VIEWPORT_ROW,
  * set the row field to the absolute row offset from the top of the
  * scrollable area (the same row space as the offset field of
- * GhosttyTerminalScrollbar). For other behaviors, the value is ignored.
+ * GhosttyTerminalScrollbar). When using
+ * GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT, set delta_prompt to the signed
+ * number of prompts to move. See GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT for
+ * the navigation behavior. For other behaviors, the value is ignored.
  *
  * @param terminal The terminal handle (may be NULL, in which case this is a no-op)
  * @param behavior The scroll behavior as a tagged union
