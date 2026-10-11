@@ -231,6 +231,13 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyTerminalModeConfig", terminal.ModeConfig),
     .initStruct("GhosttyTerminalProgramStatus", terminal.ProgramStatus),
     .initStruct("GhosttyTerminalProgressReport", terminal.ProgressReport),
+    .initTaggedStruct("GhosttyTerminalResizeWindow", terminal.ResizeWindow.C, "tag", "value", .generated),
+    .initStruct("GhosttyTerminalResizeWindowGrid", terminal.ResizeWindowGrid),
+    .initUnion(
+        "GhosttyTerminalResizeWindowValue",
+        terminal.ResizeWindow.CValue,
+        terminal.ResizeWindow.C,
+    ),
     .initStruct("GhosttyTerminalScrollbar", terminal.TerminalScrollbar),
     .initStruct("GhosttyTerminalSemanticPrompt", terminal.SemanticPrompt),
     .initTaggedStruct("GhosttyTerminalScrollViewport", terminal.ScrollViewport, "tag", "value", .generated),
@@ -343,6 +350,7 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttyTerminalProgressState", terminal.ProgressState, "GHOSTTY_TERMINAL_PROGRESS_STATE_"),
     .initEnum("GhosttyTerminalPromptRedraw", terminal.PromptRedraw, "GHOSTTY_TERMINAL_PROMPT_REDRAW_"),
     .initEnum("GhosttyTerminalScreen", terminal.TerminalScreen, "GHOSTTY_TERMINAL_SCREEN_"),
+    .initEnum("GhosttyTerminalResizeWindowTag", terminal.ResizeWindow.Tag, "GHOSTTY_TERMINAL_RESIZE_WINDOW_"),
     .initEnum("GhosttyTerminalScrollViewportTag", terminal.ZigTerminal.ScrollViewport.Tag, "GHOSTTY_SCROLL_VIEWPORT_"),
     .initEnum("GhosttyTerminalUnknownSequenceTag", terminal.UnknownSequence.Tag, "GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_"),
 
@@ -754,6 +762,7 @@ const Json = struct {
             if (std.mem.eql(u8, owner, "GhosttyPoint")) return "GhosttyPointValue";
             if (std.mem.eql(u8, owner, "GhosttySgrAttribute")) return "GhosttySgrAttributeValue";
             if (std.mem.eql(u8, owner, "GhosttyStyleColor")) return "GhosttyStyleColorValue";
+            if (std.mem.eql(u8, owner, "GhosttyTerminalResizeWindow")) return "GhosttyTerminalResizeWindowValue";
             if (std.mem.eql(u8, owner, "GhosttyTerminalScrollViewport")) return "GhosttyTerminalScrollViewportValue";
             if (std.mem.eql(u8, owner, "GhosttyTerminalUnknownSequence")) return "GhosttyTerminalUnknownSequenceValue";
         }
