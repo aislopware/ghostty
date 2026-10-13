@@ -776,7 +776,14 @@ pub const ScreenFormatter = struct {
                 if (self.screen.saved_cursor) |saved| try self.formatSavedCursor(t, saved, writer);
             }
             const cursor = &self.screen.cursor;
-            try self.formatCursorAt(writer, cursor.x, cursor.y, cursor.pending_wrap, self.cursor_origin);
+            try self.formatCursorAt(
+                writer,
+                cursor.x,
+                cursor.y,
+                cursor.pending_wrap,
+                self.cursor_origin,
+                self.savesAsIs(cursor.x, cursor.y),
+            );
         }
 
         // Emit current SGR style state
@@ -869,6 +876,7 @@ pub const ScreenFormatter = struct {
         y: size.CellCountInt,
         pending_wrap: bool,
         origin_mode: ?CursorOrigin,
+        may_save: bool,
     ) std.Io.Writer.Error!void {
         const origin = origin_mode orelse CursorOrigin{};
 
@@ -931,7 +939,11 @@ pub const ScreenFormatter = struct {
                 replay.row = rac.row.semantic_prompt;
                 try replay.content_to(&cell_formatter, writer, cell.semantic_content, start_x, pin.y);
             }
-            try writer.writeByte(' ');
+            // A space sets the wrap. Where the saved cursor may be replaced,
+            // the space is saved with the wrap (DECSC), erased (ECH, which
+            // clears the wrap) and the cursor restored (DECRC), which sets
+            // the wrap again over a blank cell.
+            try writer.writeAll(if (may_save) " \x1b7\x1b[X\x1b8" else " ");
             return;
         }
         try cell_formatter.format(writer);
@@ -978,6 +990,24 @@ pub const ScreenFormatter = struct {
         try writer.print("\x1b[{d} q", .{blinking + steady});
     }
 
+    /// Whether a save (DECSC) at the cursor's `x`, `y` with a pending wrap
+    /// leaves the saved cursor the formatter gives as it was: there is none,
+    /// or it is that save, since the saved cursor's replay leaves the default
+    /// style, protection, invocations and the origin mode behind it.
+    fn savesAsIs(
+        self: ScreenFormatter,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+    ) bool {
+        const t = self.terminal orelse return true;
+        const saved = self.screen.saved_cursor orelse return true;
+        return saved.x == x and saved.y == y and saved.pending_wrap and
+            saved.style.eql(.{}) and !saved.protected and
+            saved.charset.gl == .G0 and saved.charset.gr == .G2 and
+            std.meta.eql(saved.charset.charsets, self.screen.charset.charsets) and
+            saved.origin == t.modes.get(.origin);
+    }
+
     /// The state DECSC saved, saved again with DECSC: the position (with a
     /// pending wrap), the pen, the protection, origin mode and the character
     /// sets. Each is then given back to what it is, for the extras after
@@ -1002,6 +1032,7 @@ pub const ScreenFormatter = struct {
                 .x = t.scrolling_region.left,
                 .y = t.scrolling_region.top,
             } else null,
+            true,
         );
         try writer.print("{f}", .{saved.style.formatterVt()});
         if (saved.protected) try writer.writeAll("\x1b[1\"q");
@@ -6607,7 +6638,8 @@ test "Terminal vt cursor keeps the semantic content of an empty cell under a sav
     const io = testing.io;
 
     for ([_][]const u8{
-        // The saved cell is erased, and the live cursor is left in input.
+        // The saved cell is scrolled away (ED2 at a prompt), and the live
+        // cursor is left in input.
         "\x1b]133;A\x1b\\abcd\x1b7\x1b[2J\x1b[2;1H\x1b]133;B\x1b\\x",
         // The same with the live cursor in prompt content.
         "\x1b]133;A\x1b\\abcd\x1b7\x1b[2J\x1b[2;1H\x1b]133;A\x1b\\x",
@@ -6626,6 +6658,7 @@ test "Terminal vt cursor keeps the semantic content of an empty cell under a sav
         formatter.opts.semantic_prompt = true;
         formatter.opts.unwrap = true;
         formatter.opts.trim = false;
+        formatter.opts.trailing_rows = true;
         try formatter.format(&builder.writer);
 
         var target = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
@@ -6745,6 +6778,137 @@ test "Terminal vt keeps the cells a program protected" {
     const target_contents = try target.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
     defer alloc.free(target_contents);
     try testing.expectEqualStrings("ab\nef", source_contents);
+    try testing.expectEqualStrings(source_contents, target_contents);
+}
+
+test "Terminal vt cursor preserves pending wrap over a blank cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer source.deinit(alloc);
+
+    // Saving the cursor saves the pending wrap and erasing the line clears
+    // it, so restoring the cursor leaves a pending wrap over a blank cell.
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("abcd\x1b7\x1b[2K\x1b8");
+    try testing.expect(source.screens.active.cursor.pending_wrap);
+    try testing.expect(!source.screens.active.cursor.page_cell.hasText());
+
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    try testing.expectEqual(builder.writer.buffered().len, pin_map.count());
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    try testing.expectEqual(
+        source.screens.active.cursor.pending_wrap,
+        target.screens.active.cursor.pending_wrap,
+    );
+    try testing.expect(!target.screens.active.cursor.page_cell.hasText());
+
+    // Formatting the restored terminal gives the same output.
+    var target_builder: std.Io.Writer.Allocating = .init(alloc);
+    defer target_builder.deinit();
+    var target_formatter: TerminalFormatter = .init(&target, .vt);
+    target_formatter.extra = .none;
+    target_formatter.extra.screen.cursor = true;
+    try target_formatter.format(&target_builder.writer);
+    try testing.expectEqualStrings(
+        builder.writer.buffered(),
+        target_builder.writer.buffered(),
+    );
+
+    // The next character goes on the next row.
+    source_stream.nextSlice("X");
+    target_stream.nextSlice("X");
+    const source_contents = try source.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(source_contents);
+    const target_contents = try target.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(target_contents);
+    try testing.expectEqualStrings(source_contents, target_contents);
+}
+
+test "Terminal vt cursor preserves pending wrap after a wide character" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer source.deinit(alloc);
+
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("ab\u{1F600}");
+    try testing.expect(source.screens.active.cursor.pending_wrap);
+    try testing.expectEqual(.spacer_tail, source.screens.active.cursor.page_cell.wide);
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+    try formatter.format(&builder.writer);
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    try testing.expectEqual(
+        source.screens.active.cursor.pending_wrap,
+        target.screens.active.cursor.pending_wrap,
+    );
+
+    source_stream.nextSlice("X");
+    target_stream.nextSlice("X");
+    const source_contents = try source.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(source_contents);
+    const target_contents = try target.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(target_contents);
     try testing.expectEqualStrings(source_contents, target_contents);
 }
 
