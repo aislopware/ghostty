@@ -1845,8 +1845,8 @@ pub const PageFormatter = struct {
         else
             true;
 
-        // Track hyperlink state for HTML output. We need to close </a> tags
-        // when the hyperlink changes or ends.
+        // Track hyperlink state for HTML and VT output. We need to close
+        // </a> tags or OSC 8 when the hyperlink changes or ends.
         var current_hyperlink_id: ?hyperlink.Id = null;
 
         // Whether a VT replay's semantic prompt state is emitted, and whether
@@ -1859,6 +1859,9 @@ pub const PageFormatter = struct {
         // The first column of a single column the replay wrapped into, to be
         // printed again as the prompt it is with the row flagged this.
         var reprint: ?Row.SemanticPrompt = null;
+
+        // Most pages hold no hyperlinks, so check once instead of per cell.
+        const page_hyperlinks = self.page.hyperlinkCount() > 0;
 
         for (start_y..end_y + 1) |y_usize| {
             const y: size.CellCountInt = @intCast(y_usize);
@@ -2088,19 +2091,38 @@ pub const PageFormatter = struct {
                         if (style_id == invalid_style_id) break :fast;
                     }
 
-                    const consumed = try self.writeCellRun(
-                        emit,
-                        self.point_map != null,
-                        writer,
-                        cells_subset[cell_i..],
-                        x,
-                        y,
-                        style_id,
-                        current_hyperlink_id,
-                        protected,
-                        if (semantic) replay.content else null,
-                        &blank_cells,
-                    );
+                    // Pages without hyperlinks take a copy of the run
+                    // loop that never checks for them.
+                    const consumed = if (formatStyled(emit) and page_hyperlinks)
+                        try self.writeCellRun(
+                            emit,
+                            true,
+                            self.point_map != null,
+                            writer,
+                            cells_subset[cell_i..],
+                            x,
+                            y,
+                            style_id,
+                            current_hyperlink_id,
+                            protected,
+                            if (semantic) replay.content else null,
+                            &blank_cells,
+                        )
+                    else
+                        try self.writeCellRun(
+                            emit,
+                            false,
+                            self.point_map != null,
+                            writer,
+                            cells_subset[cell_i..],
+                            x,
+                            y,
+                            style_id,
+                            current_hyperlink_id,
+                            protected,
+                            if (semantic) replay.content else null,
+                            &blank_cells,
+                        );
 
                     // Zero cells consumed means the first cell isn't
                     // eligible for the fast path; handle it below.
@@ -2293,8 +2315,9 @@ pub const PageFormatter = struct {
 
                 // Hyperlink state
                 hyperlink: {
-                    // HTML emits hyperlinks as anchors, VT as OSC 8.
+                    // HTML emits hyperlinks as anchors and VT as OSC 8.
                     if (comptime !formatStyled(emit)) break :hyperlink;
+                    if (!page_hyperlinks) break :hyperlink;
 
                     // Get the hyperlink ID. This ID is our internal ID,
                     // not necessarily the OSC8 ID.
@@ -2308,11 +2331,15 @@ pub const PageFormatter = struct {
                     if (current_hyperlink_id == link_id_) break :hyperlink;
 
                     // If our prior hyperlink ID was non-null, we need to
-                    // close it because the ID has changed.
-                    if (current_hyperlink_id != null) {
+                    // close it because the ID has changed. In VT, opening
+                    // a hyperlink replaces the open one, so it is only
+                    // closed when no hyperlink follows.
+                    if (current_hyperlink_id != null and
+                        (emit == .html or link_id_ == null))
+                    {
                         try self.formatHyperlinkClose(emit, writer);
-                        current_hyperlink_id = null;
                     }
+                    current_hyperlink_id = null;
 
                     // Set our current hyperlink ID
                     const link_id = link_id_ orelse break :hyperlink;
@@ -2331,22 +2358,11 @@ pub const PageFormatter = struct {
 
                     // If we have a point map, we map the hyperlink to
                     // this cell.
-                    if (self.point_map) |*map| {
-                        var discarding: std.Io.Writer.Discarding = .init(&.{});
-                        try self.formatHyperlinkOpen(
-                            emit,
-                            &discarding.writer,
-                            link,
-                        );
-                        map.map.appendNTimes(
-                            map.alloc,
-                            .{ .x = x, .y = y },
-                            std.math.cast(
-                                usize,
-                                discarding.count,
-                            ) orelse return error.WriteFailed,
-                        ) catch return error.WriteFailed;
-                    }
+                    if (self.point_map) |*map| map.map.appendNTimes(
+                        map.alloc,
+                        .{ .x = x, .y = y },
+                        try self.hyperlinkOpenLen(emit, link),
+                    ) catch return error.WriteFailed;
                 }
 
                 // A column printed again prints as output first.
@@ -2482,7 +2498,11 @@ pub const PageFormatter = struct {
     ///   - The codepoint map is empty.
     ///   - For styled formats, `run_style_id` is the valid interned
     ///     page-local id of the currently active style.
-    ///   - For HTML, no hyperlink is currently open.
+    ///   - `run_hyperlink_id` is the open hyperlink (or none).
+    ///
+    /// `hyperlinks` is whether the page holds any hyperlinks. Without
+    /// them the run never checks a cell's hyperlink state, which keeps
+    /// the common case free of the per-cell check.
     ///
     /// `run_x`/`run_y` are the page coordinates of `cells[0]`, used for
     /// point map tracking.
@@ -2498,6 +2518,7 @@ pub const PageFormatter = struct {
     noinline fn writeCellRun(
         self: *const PageFormatter,
         comptime emit: Format,
+        comptime hyperlinks: bool,
         track_points: bool,
         writer: *std.Io.Writer,
         cells: []const Cell,
@@ -2583,7 +2604,7 @@ pub const PageFormatter = struct {
             // cell must belong to the currently open hyperlink (or none).
             // Transitions take the slow path. This is checked after blank
             // accounting because blank cells never touch hyperlink state.
-            if (comptime formatStyled(emit)) {
+            if (comptime hyperlinks) {
                 if (cell.hyperlink) {
                     const run_id = run_hyperlink_id orelse break;
                     const cell_id = self.page.lookupHyperlink(cell) orelse break;
@@ -3076,17 +3097,18 @@ pub const PageFormatter = struct {
         writer: *std.Io.Writer,
         link: *const hyperlink.PageEntry,
     ) std.Io.Writer.Error!void {
-        const memory = self.page.memory;
-        const uri = link.uri.offset.ptr(memory)[0..link.uri.len];
+        const uri = link.uri.slice(self.page.memory);
         switch (emit) {
             .plain => unreachable,
 
-            // An implicit id is the terminal's own, so the link is opened
-            // without one and the replaying terminal assigns its own.
+            // OSC 8, with the explicit id if there is one: an implicit id
+            // is the terminal's own, so the link is opened without one and
+            // the replaying terminal assigns its own. Keep hyperlinkOpenLen
+            // in sync.
             .vt => switch (link.id) {
                 .explicit => |id| try writer.print(
                     "\x1b]8;id={s};{s}\x1b\\",
-                    .{ id.offset.ptr(memory)[0..id.len], uri },
+                    .{ id.slice(self.page.memory), uri },
                 ),
                 .implicit => try writer.print("\x1b]8;;{s}\x1b\\", .{uri}),
             },
@@ -3100,6 +3122,33 @@ pub const PageFormatter = struct {
                     byte,
                 );
                 try writer.writeAll("\">");
+            },
+        }
+    }
+
+    /// The number of bytes formatHyperlinkOpen writes for `link`.
+    fn hyperlinkOpenLen(
+        self: PageFormatter,
+        comptime emit: Format,
+        link: *const hyperlink.PageEntry,
+    ) std.Io.Writer.Error!usize {
+        switch (emit) {
+            .plain => unreachable,
+
+            // "\x1b]8;id=" ID ";" URI "\x1b\\" or "\x1b]8;;" URI "\x1b\\"
+            .vt => return link.uri.len + switch (link.id) {
+                .explicit => |id| id.len + 10,
+                .implicit => 7,
+            },
+
+            // The URI is escaped, so count the bytes.
+            .html => {
+                var discarding: std.Io.Writer.Discarding = .init(&.{});
+                try self.formatHyperlinkOpen(emit, &discarding.writer, link);
+                return std.math.cast(
+                    usize,
+                    discarding.count,
+                ) orelse error.WriteFailed;
             },
         }
     }
@@ -7024,6 +7073,286 @@ test "Screen vt with hyperlink" {
     for (0..output.len) |i| {
         try testing.expectEqual(node, pin_map.get(i).?.node);
     }
+}
+
+test "Page VT with hyperlinks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ normal");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var point_map: std.ArrayList(Coordinate) = .empty;
+    defer point_map.deinit(alloc);
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    try testing.expectEqualStrings(
+        "\x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ normal",
+        output,
+    );
+    try testing.expectEqual(output.len, point_map.items.len);
+}
+
+test "Page VT with explicit hyperlink id" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b]8;id=a;https://example.com\x1b\\one\x1b]8;;\x1b\\");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b]8;id=a;https://example.com\x1b\\one\x1b]8;;\x1b\\",
+        builder.writer.buffered(),
+    );
+}
+
+test "Page VT with hyperlink across rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The hyperlink stays open across the line break.
+    s.nextSlice("\x1b]8;;https://example.com\x1b\\ab\r\ncd\x1b]8;;\x1b\\");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b]8;;https://example.com\x1b\\ab\r\ncd\x1b]8;;\x1b\\",
+        builder.writer.buffered(),
+    );
+}
+
+test "Page VT closes a hyperlink before blank cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The cells skipped by the cursor movement are blank and have no
+    // hyperlink, so the spaces written for them must not have one either.
+    s.nextSlice("\x1b]8;;https://example.com\x1b\\ab\x1b[5Gcd\x1b]8;;\x1b\\");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\" ++
+            "  " ++
+            "\x1b]8;;https://example.com\x1b\\cd\x1b]8;;\x1b\\",
+        builder.writer.buffered(),
+    );
+}
+
+test "Page VT switches between hyperlinks without closing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Opening a hyperlink replaces the open one, so no close is needed
+    // between two hyperlinks.
+    s.nextSlice("\x1b]8;;https://a.example\x1b\\ab\x1b]8;;https://b.example\x1b\\cd\x1b]8;;\x1b\\");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var point_map: std.ArrayList(Coordinate) = .empty;
+    defer point_map.deinit(alloc);
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+    try formatter.format(&builder.writer);
+    const open_a = "\x1b]8;;https://a.example\x1b\\";
+    const open_b = "\x1b]8;;https://b.example\x1b\\";
+    const close = "\x1b]8;;\x1b\\";
+    try testing.expectEqualStrings(
+        open_a ++ "ab" ++ open_b ++ "cd" ++ close,
+        builder.writer.buffered(),
+    );
+
+    // Each opening maps to its first cell, the close to the last cell.
+    var expected: std.ArrayList(Coordinate) = .empty;
+    defer expected.deinit(alloc);
+    try expected.appendNTimes(alloc, .{ .x = 0, .y = 0 }, open_a.len + 1);
+    try expected.append(alloc, .{ .x = 1, .y = 0 });
+    try expected.appendNTimes(alloc, .{ .x = 2, .y = 0 }, open_b.len + 1);
+    try expected.appendNTimes(alloc, .{ .x = 3, .y = 0 }, 1 + close.len);
+    try testing.expectEqualSlices(Coordinate, expected.items, point_map.items);
+}
+
+test "Page VT closes a hyperlink on a row without hyperlinks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The hyperlink is still open at the end of the first row, and the
+    // second row has none.
+    s.nextSlice("\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\\r\ncd");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b]8;;https://example.com\x1b\\ab\r\n\x1b]8;;\x1b\\cd",
+        builder.writer.buffered(),
+    );
+}
+
+test "Terminal vt restores hyperlinks of cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 3,
+    });
+    defer source.deinit(alloc);
+
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice(
+        "\x1b]8;;https://a.example\x1b\\aa\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=x;https://b.example\x1b\\bb\x1b[5Gbb\x1b]8;;\x1b\\\r\n" ++
+            "\x1b]8;;https://a.example\x1b\\\x1b[1mcc\x1b[0m\x1b]8;;\x1b\\ plain",
+    );
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    try formatter.format(&builder.writer);
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 3,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    for (0..3) |y| for (0..20) |x| {
+        const pt: @import("point.zig").Point = .{ .active = .{
+            .x = @intCast(x),
+            .y = @intCast(y),
+        } };
+        const a = source.screens.active.pages.getCell(pt).?;
+        const b = target.screens.active.pages.getCell(pt).?;
+        try testing.expectEqual(a.cell.hyperlink, b.cell.hyperlink);
+        if (!a.cell.hyperlink) continue;
+
+        const a_page = a.node.page();
+        const b_page = b.node.page();
+        const a_link = a_page.hyperlink_set.get(
+            a_page.memory,
+            a_page.lookupHyperlink(a.cell).?,
+        );
+        const b_link = b_page.hyperlink_set.get(
+            b_page.memory,
+            b_page.lookupHyperlink(b.cell).?,
+        );
+        try testing.expectEqualStrings(
+            a_link.uri.slice(a_page.memory),
+            b_link.uri.slice(b_page.memory),
+        );
+        try testing.expectEqual(
+            std.meta.activeTag(a_link.id),
+            std.meta.activeTag(b_link.id),
+        );
+        if (a_link.id == .explicit) try testing.expectEqualStrings(
+            a_link.id.explicit.slice(a_page.memory),
+            b_link.id.explicit.slice(b_page.memory),
+        );
+    };
 }
 
 test "Screen vt with protection" {

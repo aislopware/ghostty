@@ -2840,7 +2840,7 @@ pub fn Stream(comptime H: type) type {
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,
-                .context_signal,
+                .hierarchical_context,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});
                 },
