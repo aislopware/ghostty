@@ -52,6 +52,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+aredmondd
 arneshbanerjee
 arvin7liu
 athaapa
@@ -99,6 +100,8 @@ danneu
 danulqua
 dariogriffo
 dave92082
+davey-hughes
+davidhodge
 -davidpmclaughlin Refusing to follow AI policy and exhibit good faith behavior
 davidsanchez222
 deblasis
@@ -149,6 +152,7 @@ gagbo
 ghokun
 gmile
 gordonbondon
+-gotar No HITL
 gotenksin
 gpanders
 guilhermetk
@@ -219,6 +223,7 @@ lebdron
 lepips
 liby
 linustalacko
+locriani
 lonsagisawa
 lotheac
 louisunlimited
@@ -395,3 +400,4 @@ zeshi09
 zlitus
 -zorzysty Meatproxying
 zubb
+zzznu
