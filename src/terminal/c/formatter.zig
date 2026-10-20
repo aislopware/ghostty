@@ -75,9 +75,6 @@ pub const TerminalOptions = extern struct {
     /// For VT, emit every row's and cell's semantic prompt state (OSC 133).
     semantic_prompt: bool = false,
 
-    /// For VT, end with the blank rows after the last one with text.
-    trailing_rows: bool = false,
-
     /// C: GhosttyFormatterTerminalExtra
     pub const Extra = extern struct {
         size: usize = @sizeOf(Extra),
@@ -151,7 +148,6 @@ fn terminal_new_(
         .unwrap = opts.unwrap,
         .trim = opts.trim,
         .semantic_prompt = opts.semantic_prompt,
-        .trailing_rows = opts.trailing_rows,
     });
     formatter.extra = opts.extra.toZig();
 

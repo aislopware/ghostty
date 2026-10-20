@@ -98,9 +98,10 @@ pub const Options = struct {
     unwrap: bool = false,
 
     /// Trim trailing whitespace on lines with other text. Trailing blank
-    /// lines are always trimmed. This only affects trailing whitespace
-    /// on rows that have at least one other cell with text. Whitespace
-    /// is currently only space characters (0x20).
+    /// lines are always trimmed, except in VT output without trimming,
+    /// where they are part of the layout. This only affects trailing
+    /// whitespace on rows that have at least one other cell with text.
+    /// Whitespace is currently only space characters (0x20).
     trim: bool = true,
 
     /// Replace matching Unicode codepoints with some other values.
@@ -112,13 +113,6 @@ pub const Options = struct {
     /// flag and each cell its content type (prompt, input or output). Rows
     /// with no text but a prompt flag are emitted too.
     semantic_prompt: bool = false,
-
-    /// For VT, end with the blank rows after the last one with text, as
-    /// newlines, where they are otherwise left out. A replay into a fresh
-    /// terminal of the same size then has every row that was formatted:
-    /// the history of a screen whose last rows are blank keeps its length,
-    /// and the rows below it stay where they are.
-    trailing_rows: bool = false,
 
     /// Set a background and foreground color to use for the "screen".
     /// For styled formats, this will emit the proper sequences or styles.
@@ -1212,16 +1206,34 @@ pub const PageListFormatter = struct {
             page_state = try formatter.formatWithState(writer);
         }
 
-        // The pending newlines include one after the last blank row, which
-        // would add a row.
-        const state = page_state orelse return;
-        if (self.opts.emit != .vt or !self.opts.trailing_rows or state.rows < 2) return;
-        for (1..state.rows) |_| try writer.writeAll("\r\n");
-        if (self.pin_map) |*m| m.map.append(
-            m.alloc,
-            m.map.getLastOrNull() orelse br,
-            (state.rows - 1) * 2,
-        ) catch return error.WriteFailed;
+        // VT output without trimming keeps the blank rows at the end:
+        // they are part of the layout, and a replay without them scrolls
+        // less, so the rows above them end up too low on the screen.
+        if (self.opts.emit == .vt and !self.opts.trim) {
+            const state = page_state orelse return;
+            if (state.rows <= 1) return;
+
+            // The last row needs no newline after it.
+            const count = state.rows - 1;
+            try writer.splatBytesAll("\r\n", count);
+
+            // Each newline maps to the row it ends, as between pages:
+            // the first one to the end of the last row with text.
+            if (self.pin_map) |*m| {
+                for (0..count) |i| {
+                    const row = br.up(count - i) orelse tl;
+                    const pin = if (i == 0)
+                        m.map.get(m.map.count() -| 1) orelse row
+                    else
+                        row;
+                    m.map.append(m.alloc, .{
+                        .node = pin.node,
+                        .x = if (i == 0) pin.x else 0,
+                        .y = pin.y,
+                    }, 2) catch return error.WriteFailed;
+                }
+            }
+        }
     }
 };
 
@@ -2091,6 +2103,11 @@ pub const PageFormatter = struct {
                         if (style_id == invalid_style_id) break :fast;
                     }
 
+                    // The run steps over VT blanks (CUF), which stays on
+                    // this row: the blanks a wrapped row ends in are
+                    // written before the replay wraps into this one.
+                    if (comptime emit == .vt) assert(blank_cells <= cell_i);
+
                     // Pages without hyperlinks take a copy of the run
                     // loop that never checks for them.
                     const consumed = if (formatStyled(emit) and page_hyperlinks)
@@ -2168,6 +2185,19 @@ pub const PageFormatter = struct {
 
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
+                // VT steps over them (CUF): spaces would turn them into text,
+                // and an empty cell a replay never writes keeps no pen,
+                // protection, hyperlink or content type. They are all on
+                // this row (the blanks a wrapped row ends in are written
+                // before the replay wraps into this one), but a replay that
+                // has yet to wrap into it stays on the row before until a
+                // cell is written, so the first is written as a space then.
+                if (comptime emit == .vt) if (blank_cells > 0 and wrap_fix == null) {
+                    assert(blank_cells <= cell_i);
+                    try self.writeBlankStep(writer, blank_cells, x, y);
+                    blank_cells = 0;
+                };
+
                 if (blank_cells > 0) {
                     // Styled formats only count unstyled cells outside any
                     // hyperlink as blank, so the spaces that stand in for
@@ -2215,13 +2245,17 @@ pub const PageFormatter = struct {
                         wrap_fix = null;
                     }
                     const rest = blank_cells - before;
-                    try writer.splatByteAll(' ', rest);
-                    if (self.point_map) |*map| try self.appendBlankPoints(
-                        map,
-                        rest,
-                        x,
-                        y,
-                    );
+                    if (comptime emit == .vt) {
+                        if (rest > 0) try self.writeBlankStep(writer, rest, x, y);
+                    } else {
+                        try writer.splatByteAll(' ', rest);
+                        if (self.point_map) |*map| try self.appendBlankPoints(
+                            map,
+                            rest,
+                            x,
+                            y,
+                        );
+                    }
 
                     blank_cells = 0;
                 }
@@ -2402,9 +2436,47 @@ pub const PageFormatter = struct {
                         }
                     },
 
-                    // Cells with only background color (no text). Emit a space
-                    // with the appropriate background color SGR sequence.
+                    // Cells with only background color (no text).
                     .bg_color_palette, .bg_color_rgb => {
+                        // VT restores them as they are made: erasing with
+                        // the background set (ECH) leaves empty cells
+                        // carrying it, where a space would be text. The
+                        // pen is already the background, from the style
+                        // block above. A run of the same background is
+                        // erased at once, then stepped over (CUF).
+                        //
+                        // Not where the replay has yet to wrap into this
+                        // row, as it stays on the row before until a cell
+                        // is written; nor in the last column of a row it
+                        // wraps from, as it wraps only from a cell written
+                        // there. Those are written as spaces.
+                        if (comptime emit == .vt) if (wrap_fix == null) bg: {
+                            const wraps = vt_join and row.wrap;
+                            var run: usize = 1;
+                            while (cell_i + run < cells_subset.len and
+                                sameBackground(cell, &cells_subset[cell_i + run])) run += 1;
+                            if (wraps and row_start_x + cell_i + run == cols) run -= 1;
+                            if (run == 0) break :bg;
+
+                            var buf: [32]u8 = undefined;
+                            const seq = std.fmt.bufPrint(
+                                &buf,
+                                "\x1b[{d}X\x1b[{d}C",
+                                .{ run, run },
+                            ) catch unreachable;
+                            try writer.writeAll(seq);
+                            if (self.point_map) |*map| map.map.appendNTimes(
+                                map.alloc,
+                                .{ .x = x, .y = y },
+                                seq.len,
+                            ) catch return error.WriteFailed;
+
+                            // The continue expression adds the last one.
+                            cell_i += run - 1;
+                            continue;
+                        };
+
+                        // Otherwise a space, in the background's style.
                         try writer.writeByte(' ');
                         if (self.point_map) |*map| map.map.append(
                             map.alloc,
@@ -2622,17 +2694,23 @@ pub const PageFormatter = struct {
             }
 
             // This cell produces output: materialize accumulated blanks.
-            // Blanks are unstyled and outside any hyperlink, so under a
-            // style or a link the slow path closes them first; and they
-            // hold output, which the slow path switches to first.
+            // VT steps over them (CUF), which the caller guarantees stays
+            // on a row the replay has entered: an empty cell a replay never
+            // writes keeps no pen, protection, hyperlink or content type.
+            if (comptime emit == .vt) if (pending > 0) {
+                try writer.writeAll(buf[0..len]);
+                len = 0;
+                try self.writeBlankStep(writer, pending, x, run_y);
+                pending = 0;
+            };
+
+            // Other styled formats write them as spaces, unstyled and
+            // outside any hyperlink, so under a style or a link the slow
+            // path closes them first.
             if (pending > 0) {
                 if (comptime formatStyled(emit)) {
                     if (run_style_id != 0 or run_hyperlink_id != null) break;
                 }
-                if (comptime emit == .vt) {
-                    if (run_protected) break;
-                }
-                if (run_semantic) |content| if (content != .output) break;
                 if (track_points) try self.appendBlankPoints(
                     &self.point_map.?,
                     pending,
@@ -2779,6 +2857,37 @@ pub const PageFormatter = struct {
         }
 
         return len.* - start;
+    }
+
+    /// Step over `count` blank cells (CUF) just before the cell at
+    /// (x, y), all on that row. The point map entries map to the first
+    /// blank cell.
+    fn writeBlankStep(
+        self: *const PageFormatter,
+        writer: *std.Io.Writer,
+        count: usize,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+    ) std.Io.Writer.Error!void {
+        var buf: [32]u8 = undefined;
+        const seq = std.fmt.bufPrint(&buf, "\x1b[{d}C", .{count}) catch unreachable;
+        try writer.writeAll(seq);
+        if (self.point_map) |*map| map.map.appendNTimes(
+            map.alloc,
+            .{ .x = x - @as(size.CellCountInt, @intCast(count)), .y = y },
+            seq.len,
+        ) catch return error.WriteFailed;
+    }
+
+    /// Whether two cells both only carry the same background color.
+    fn sameBackground(a: *const Cell, b: *const Cell) bool {
+        if (a.content_tag != b.content_tag) return false;
+        return switch (a.content_tag) {
+            .bg_color_palette => a.content.color_palette.data ==
+                b.content.color_palette.data,
+            .bg_color_rgb => std.meta.eql(a.content.color_rgb, b.content.color_rgb),
+            .codepoint, .codepoint_grapheme => false,
+        };
     }
 
     /// Append the point map entries for a run of `count` blank cells
@@ -5803,6 +5912,131 @@ test "PageList plain with end_x only" {
     }
 }
 
+test "PageList VT without trim keeps trailing blank rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 6,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("one\r\ntwo");
+
+    const pages = &t.screens.active.pages;
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: PageListFormatter = .init(pages, .vt);
+    formatter.opts.trim = false;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // Six rows, two with text, so five newlines.
+    try testing.expectEqualStrings("one\r\ntwo\r\n\r\n\r\n\r\n", output);
+
+    // Each newline maps to the row it ends: the first to the end of
+    // the text, the others to the start of a blank row.
+    try testing.expectEqual(output.len, pin_map.count());
+    const trailing = "one\r\ntwo".len;
+    for (0..4) |i| {
+        const pin = pin_map.get(trailing + i * 2).?;
+        try testing.expectEqual(pin, pin_map.get(trailing + i * 2 + 1).?);
+        try testing.expectEqual(@as(size.CellCountInt, if (i == 0) 2 else 0), pin.x);
+        try testing.expectEqual(@as(size.CellCountInt, @intCast(1 + i)), pin.y);
+    }
+
+    // Trimmed output and other formats still drop them.
+    var trimmed: std.Io.Writer.Allocating = .init(alloc);
+    defer trimmed.deinit();
+    var trimming: PageListFormatter = .init(pages, .vt);
+    try trimming.format(&trimmed.writer);
+    try testing.expectEqualStrings("one\r\ntwo", trimmed.writer.buffered());
+
+    var plain: std.Io.Writer.Allocating = .init(alloc);
+    defer plain.deinit();
+    var plain_formatter: PageListFormatter = .init(pages, .{
+        .emit = .plain,
+        .trim = false,
+    });
+    try plain_formatter.format(&plain.writer);
+    try testing.expectEqualStrings("one\ntwo", plain.writer.buffered());
+}
+
+test "PageList VT without trim keeps a blank screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 4,
+    });
+    defer t.deinit(alloc);
+
+    var formatter: PageListFormatter = .init(&t.screens.active.pages, .vt);
+    formatter.opts.trim = false;
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings("\r\n\r\n\r\n", builder.writer.buffered());
+}
+
+test "PageList VT without trim keeps trailing blank rows across pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Text on the last row of the first page, then two blank rows on
+    // the next one.
+    const pages = &t.screens.active.pages;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
+    s.nextSlice("x\r\n\r\n");
+    try testing.expect(pages.pages.first != pages.pages.last);
+
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: PageListFormatter = .init(pages, .vt);
+    formatter.opts.trim = false;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+    try testing.expect(std.mem.endsWith(u8, output, "x\r\n\r\n"));
+    try testing.expectEqual(output.len, pin_map.count());
+
+    // The first newline ends the row with text on the first page, the
+    // second the first blank row on the next page.
+    const first = pin_map.get(output.len - 4).?;
+    try testing.expectEqual(pages.pages.first.?, first.node);
+    try testing.expectEqual(first_page_rows - 1, first.y);
+    const second = pin_map.get(output.len - 2).?;
+    try testing.expectEqual(pages.pages.last.?, second.node);
+    try testing.expectEqual(@as(size.CellCountInt, 0), second.x);
+}
+
 test "PageList plain rectangle basic" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -6707,7 +6941,6 @@ test "Terminal vt cursor keeps the semantic content of an empty cell under a sav
         formatter.opts.semantic_prompt = true;
         formatter.opts.unwrap = true;
         formatter.opts.trim = false;
-        formatter.opts.trailing_rows = true;
         try formatter.format(&builder.writer);
 
         var target = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
@@ -7172,7 +7405,7 @@ test "Page VT with hyperlink across rows" {
     );
 }
 
-test "Page VT closes a hyperlink before blank cells" {
+test "Page VT steps over blank cells in a hyperlink" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -7190,7 +7423,8 @@ test "Page VT closes a hyperlink before blank cells" {
     defer s.deinit();
 
     // The cells skipped by the cursor movement are blank and have no
-    // hyperlink, so the spaces written for them must not have one either.
+    // hyperlink. Stepping over them doesn't write them, so the
+    // hyperlink stays open.
     s.nextSlice("\x1b]8;;https://example.com\x1b\\ab\x1b[5Gcd\x1b]8;;\x1b\\");
 
     const pages = &t.screens.active.pages;
@@ -7199,9 +7433,43 @@ test "Page VT closes a hyperlink before blank cells" {
 
     try formatter.format(&builder.writer);
     try testing.expectEqualStrings(
-        "\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\" ++
-            "  " ++
-            "\x1b]8;;https://example.com\x1b\\cd\x1b]8;;\x1b\\",
+        "\x1b]8;;https://example.com\x1b\\ab\x1b[2Ccd\x1b]8;;\x1b\\",
+        builder.writer.buffered(),
+    );
+}
+
+test "Page VT unwrap closes a hyperlink before blank cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The blanks before the wrapped wide character carry over to the
+    // next row, so they are written as spaces, which must not have the
+    // hyperlink.
+    s.nextSlice("\x1b]8;;https://example.com\x1b\\abc\x1b[10G中\x1b]8;;\x1b\\");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.opts.unwrap = true;
+
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b]8;;https://example.com\x1b\\abc\x1b]8;;\x1b\\" ++
+            "      " ++
+            "\x1b]8;;https://example.com\x1b\\中\x1b]8;;\x1b\\",
         builder.writer.buffered(),
     );
 }
@@ -7519,6 +7787,67 @@ test "Screen vt with charsets" {
     for (0..output.len) |i| {
         try testing.expectEqual(node, pin_map.get(i).?.node);
     }
+}
+
+test "Terminal vt without trim keeps blank rows at the bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer source.deinit(alloc);
+
+    // Scroll three lines into the scrollback, then erase the bottom of
+    // the screen, as clearing below a prompt does.
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+    source_stream.nextSlice("\x1b[3;1H\x1b[J");
+
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    formatter.opts.trim = false;
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    try testing.expectEqual(builder.writer.buffered().len, pin_map.count());
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    // The blank rows are part of the layout: without them, the replay
+    // scrolls less and the rows above them end up too low.
+    const source_contents = try source.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .active = .{} },
+    );
+    defer alloc.free(source_contents);
+    const target_contents = try target.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .active = .{} },
+    );
+    defer alloc.free(target_contents);
+    try testing.expectEqualStrings(source_contents, target_contents);
+    try testing.expectEqual(
+        source.screens.active.cursor.y,
+        target.screens.active.cursor.y,
+    );
 }
 
 test "Terminal vt with scrolling region" {
@@ -8892,7 +9221,7 @@ test "Page VT blank cells between styled cells replay unstyled" {
     }
 }
 
-test "Page VT blank cells after a styled run are not styled" {
+test "Page VT steps over blank cells after a styled run" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -8912,11 +9241,11 @@ test "Page VT blank cells after a styled run are not styled" {
     var formatter: PageFormatter = .init(page, .vt);
     try formatter.format(&builder.writer);
 
-    // The style closes before the spaces and opens again after them.
+    // Stepping over the blanks writes no cell, so the style stays open.
     try testing.expect(std.mem.indexOf(
         u8,
         builder.writer.buffered(),
-        "reverse\x1b[0m    \x1b[0m\x1b[7mreverse",
+        "reverse\x1b[4Creverse",
     ) != null);
 }
 
@@ -9122,7 +9451,7 @@ test "Page VT keeps a row that only holds a background" {
     };
     const want = try vt.format(&t);
     defer alloc.free(want);
-    try testing.expect(std.mem.indexOf(u8, want, "\x1b[48;5;4m      ") != null);
+    try testing.expect(std.mem.indexOf(u8, want, "\x1b[48;5;4m\x1b[6X\x1b[6C") != null);
 
     var t2 = try Terminal.init(io, alloc, .{ .cols = 6, .rows = 3 });
     defer t2.deinit(alloc);
@@ -9410,7 +9739,7 @@ test "Page VT unwrap ends a wrapped row with a newline where a wrap would not br
     }
 }
 
-test "Screen VT trailing rows keep a scrolled screen's history" {
+test "Screen VT without trim keeps a scrolled screen's history" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -9422,12 +9751,12 @@ test "Screen VT trailing rows keep a scrolled screen's history" {
     // Five rows of text, then the last two of the screen left blank.
     s.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n\r\n");
 
-    for ([_]bool{ false, true }) |trailing| {
+    for ([_]bool{ true, false }) |trim| {
         var builder: std.Io.Writer.Allocating = .init(alloc);
         defer builder.deinit();
         var formatter: ScreenFormatter = .init(t.screens.active, .{
             .emit = .vt,
-            .trailing_rows = trailing,
+            .trim = trim,
         });
         formatter.extra = .none;
         try formatter.format(&builder.writer);
@@ -9442,7 +9771,7 @@ test "Screen VT trailing rows keep a scrolled screen's history" {
         defer alloc.free(want);
         const got = try t2.plainString(alloc);
         defer alloc.free(got);
-        if (trailing) {
+        if (!trim) {
             try testing.expectEqualStrings(want, got);
         } else {
             try testing.expect(!std.mem.eql(u8, want, got));
@@ -9467,6 +9796,217 @@ test "Page VT semantic prompt state is left out unless asked for" {
     var formatter: PageFormatter = .init(page, .vt);
     try formatter.format(&builder.writer);
     try testing.expect(std.mem.indexOf(u8, builder.writer.buffered(), "133;") == null);
+}
+
+test "Page VT steps over a gap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The gap after the red text is empty and has no background.
+    s.nextSlice("\x1b[41mred\x1b[0m\x1b[10Gplain");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var point_map: std.ArrayList(Coordinate) = .empty;
+    defer point_map.deinit(alloc);
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    try testing.expectEqualStrings(
+        "\x1b[0m\x1b[48;5;1mred\x1b[6C\x1b[0mplain",
+        output,
+    );
+    try testing.expectEqual(output.len, point_map.items.len);
+
+    // The CUF maps to the first cell of the gap.
+    const cuf = std.mem.indexOf(u8, output, "\x1b[6C").?;
+    for (cuf..cuf + 4) |i| try testing.expectEqual(
+        Coordinate{ .x = 3, .y = 0 },
+        point_map.items[i],
+    );
+}
+
+test "Page VT erases cells that only have a background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Erasing to the end of the row with a background set.
+    s.nextSlice("CPU:\x1b[41m\x1b[K\x1b[0m");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var point_map: std.ArrayList(Coordinate) = .empty;
+    defer point_map.deinit(alloc);
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    try testing.expectEqualStrings(
+        "CPU:\x1b[0m\x1b[48;5;1m\x1b[6X\x1b[6C\x1b[0m",
+        output,
+    );
+    try testing.expectEqual(output.len, point_map.items.len);
+}
+
+test "Page VT keeps rows that only have a background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Erasing the screen with a background set paints every cell.
+    s.nextSlice("\x1b[44m\x1b[2J\x1b[Hab\x1b[0m");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b[0m\x1b[48;5;4mab\x1b[3X\x1b[3C\x1b[0m\r\n" ++
+            "\x1b[0m\x1b[48;5;4m\x1b[5X\x1b[5C\x1b[0m",
+        builder.writer.buffered(),
+    );
+}
+
+test "Page VT unwrap writes blanks before a wrapped wide character" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The wide character doesn't fit in the last column, so it wraps,
+    // and the blanks before it carry over to the next row.
+    s.nextSlice("\x1b[41mabc\x1b[0m\x1b[10G中");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .vt);
+    formatter.opts.unwrap = true;
+
+    // CUF can't cross the row, so the blanks are spaces, written
+    // without the pen of the text before them.
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings(
+        "\x1b[0m\x1b[48;5;1mabc\x1b[0m      中",
+        builder.writer.buffered(),
+    );
+}
+
+test "Terminal vt restores gaps and cells that only have a background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 4,
+    });
+    defer source.deinit(alloc);
+
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice(
+        "\x1b[41mred\x1b[0m\x1b[10Gplain\r\n" ++
+            "\x1b[44m\x1b[K\x1b[0m\r\n" ++
+            "CPU:\x1b[42m\x1b[K\x1b[48;2;1;2;3m\x1b[15G\x1b[3X\x1b[0m\x1b[19Gx\r\n" ++
+            "  spaces  \x1b[1mbold\x1b[0m",
+    );
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    try formatter.format(&builder.writer);
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 4,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    for (0..4) |y| for (0..20) |x| {
+        const pt: @import("point.zig").Point = .{ .active = .{
+            .x = @intCast(x),
+            .y = @intCast(y),
+        } };
+        const a = source.screens.active.pages.getCell(pt).?;
+        const b = target.screens.active.pages.getCell(pt).?;
+        try testing.expectEqual(a.cell.content_tag, b.cell.content_tag);
+        try testing.expectEqual(a.cell.wide, b.cell.wide);
+        switch (a.cell.content_tag) {
+            .codepoint, .codepoint_grapheme => try testing.expectEqual(
+                a.cell.codepoint(),
+                b.cell.codepoint(),
+            ),
+            .bg_color_palette => try testing.expectEqual(
+                a.cell.content.color_palette,
+                b.cell.content.color_palette,
+            ),
+            .bg_color_rgb => try testing.expectEqual(
+                a.cell.content.color_rgb,
+                b.cell.content.color_rgb,
+            ),
+        }
+        try testing.expect(a.style().eql(b.style()));
+    };
 }
 
 test "Page HTML with hyperlinks" {

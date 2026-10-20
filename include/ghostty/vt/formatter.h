@@ -112,7 +112,11 @@ typedef struct {
   /** Whether to unwrap soft-wrapped lines. */
   bool unwrap;
 
-  /** Whether to trim trailing whitespace on non-blank lines. */
+  /**
+   * Whether to trim trailing whitespace on non-blank lines. Trailing blank
+   * lines are always trimmed, except in VT output without trimming, where
+   * they are kept as part of the layout.
+   */
   bool trim;
 
   /** Extra terminal state to include in styled output. */
@@ -126,11 +130,6 @@ typedef struct {
    *  content (OSC 133), so a replay into a fresh terminal restores them.
    *  Rows with no text but a prompt flag are emitted too. */
   bool semantic_prompt;
-
-  /** For VT, end with the blank rows after the last one with text, as
-   *  newlines, so a replay into a fresh terminal of the same size has
-   *  every row that was formatted. */
-  bool trailing_rows;
 } GhosttyFormatterTerminalOptions;
 
 /**

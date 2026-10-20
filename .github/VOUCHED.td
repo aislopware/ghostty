@@ -86,6 +86,7 @@ chernetskyi
 chronologos
 clemg
 cmwetherell
+complexsplit
 crayxt
 craziestowl
 -creativision meatproxying
@@ -270,6 +271,7 @@ myleshen
 nagato-yuzuru
 natesmyth
 neo773
+neobrain
 neoto
 neurosnap
 nicholas-ochoa
@@ -308,6 +310,7 @@ pressatojump
 prihlop
 priyans-hu
 pssalman
+pugma
 puzza007
 pyre909
 qappell
