@@ -977,7 +977,9 @@ test "manifest describes render state overscan types" {
         .get("values").?.object;
     try std.testing.expectEqual(@as(i64, 20), data_values.get("OVERSCAN").?.integer);
     try std.testing.expectEqual(@as(i64, 21), data_values.get("OVERSCAN_REQUEST").?.integer);
-    try std.testing.expectEqual(@as(i64, 22), data_values.get("ROW_DIRTY").?.integer);
+    try std.testing.expectEqual(@as(i64, 22), data_values.get("IMAGE_ITERATOR").?.integer);
+    try std.testing.expectEqual(@as(i64, 23), data_values.get("IMAGE_PLACEMENTS_GENERATION").?.integer);
+    try std.testing.expectEqual(@as(i64, 24), data_values.get("ROW_DIRTY").?.integer);
 
     const row_dirty = manifest_types.get("GhosttyRenderStateRowDirtyView").?.object;
     try std.testing.expectEqual(@as(i64, @sizeOf(render.RowDirtyView)), row_dirty.get("size").?.integer);

@@ -245,8 +245,8 @@ pub fn get(
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Data, @intFromEnum(data)) orelse {
-            log.warn("kitty_dnd_get invalid data value={d}", .{@intFromEnum(data)});
+        _ = std.enums.fromInt(Data, @backingInt(data)) orelse {
+            log.warn("kitty_dnd_get invalid data value={d}", .{@backingInt(data)});
             return .invalid_value;
         };
     }
@@ -372,8 +372,9 @@ fn dropMoveOrDrop(
     if (pos.size < @sizeOf(Position)) return .invalid_value;
     if (!s.drop.registered) return .no_value;
 
-    var sfa = std.heap.stackFallback(256, gpa(terminal_));
-    const alloc = sfa.get();
+    var stack_buf: [256]u8 = undefined;
+    var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, gpa(terminal_));
+    const alloc = stack.allocator();
     const slices = mimeSlices(alloc, mimes, mimes_len) catch |err| return switch (err) {
         error.OutOfMemory => .out_of_memory,
         error.Invalid => .invalid_value,
@@ -592,7 +593,7 @@ pub fn drag_report(
     const report: dnd.Report = switch (kind) {
         .accepted => .{ .accepted = if (value >= 0) @intCast(value) else null },
         .operation => .{
-            .operation = @as(Operation, @enumFromInt(value)).zig() orelse return .invalid_value,
+            .operation = @as(Operation, @fromBackingInt(value)).zig() orelse return .invalid_value,
         },
         .dropped => .dropped,
         .finished => .{ .finished = value != 0 },
@@ -772,7 +773,7 @@ test "kitty_dnd drop round trip" {
     tt.write("\x1b]72;t=r:x=1\x1b\\");
     try tt.expectEvents(&.{.data_request});
     try testing.expectEqual(Result.success, get(tt.t, .drop_request, @ptrCast(&req)));
-    try testing.expectEqual(Result.invalid_value, drop_respond_error(tt.t, req.id, @enumFromInt(99)));
+    try testing.expectEqual(Result.invalid_value, drop_respond_error(tt.t, req.id, @fromBackingInt(99)));
     try testing.expectEqual(Result.success, drop_respond_error(tt.t, req.id, .eio));
     try tt.expectOutput("\x1b]72;t=R:x=1:m=0;EIO:drop data request failed to read data\x1b\\");
 

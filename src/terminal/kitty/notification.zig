@@ -264,7 +264,9 @@ test "close, alive and empty notifications show nothing" {
 test "text is kept to its bound, on a character" {
     var h: Harness = .init();
     defer h.deinit();
-    const chunk = "é" ** 1000;
+    var chunk_buf: [2 * 1000]u8 = undefined;
+    for (0..1000) |i| @memcpy(chunk_buf[i * 2 ..][0..2], "é");
+    const chunk: []const u8 = &chunk_buf;
     var sent: usize = 0;
     while (sent <= max_text_bytes) : (sent += chunk.len) {
         try testing.expect(try h.send("i=big:d=0", chunk) == null);

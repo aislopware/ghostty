@@ -691,7 +691,7 @@ pub const DragSource = struct {
     ) (error{NotEnabled} || std.Io.Writer.Error)!void {
         if (!self.enabled) return error.NotEnabled;
         var header_buf: [96]u8 = undefined;
-        const header = std.fmt.bufPrint(
+        const header = std.mem.print(
             &header_buf,
             "t=o:x={d}:y={d}:X={d}:Y={d}",
             .{ pos.cell_x, pos.cell_y, pos.pixel_x, pos.pixel_y },
@@ -715,7 +715,7 @@ pub const DragSource = struct {
         var header_buf: [64]u8 = undefined;
         const header = switch (r) {
             .accepted => |idx| if (idx) |i|
-                std.fmt.bufPrint(&header_buf, "t=e:x=1:y={d}", .{i}) catch unreachable
+                std.mem.print(&header_buf, "t=e:x=1:y={d}", .{i}) catch unreachable
             else
                 "t=e:x=1",
             .operation => |op| switch (op) {
@@ -755,7 +755,7 @@ pub const DragSource = struct {
         item.requested = true;
 
         var header_buf: [64]u8 = undefined;
-        const header = std.fmt.bufPrint(
+        const header = std.mem.print(
             &header_buf,
             "t=e:x=5:y={d}",
             .{index},

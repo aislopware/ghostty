@@ -2234,8 +2234,8 @@ fn getTyped(
             if (out.size < @sizeOf(TerminalMemoryUsage)) return .invalid_value;
             out.* = .init(t, out.size);
         },
-        .cursor_semantic_content => out.* = @enumFromInt(
-            @intFromEnum(t.screens.active.cursor.semantic_content),
+        .cursor_semantic_content => out.* = @fromBackingInt(
+            @backingInt(t.screens.active.cursor.semantic_content),
         ),
         .cursor_semantic_clear_eol => out.* = t.screens.active.cursor.semantic_content_clear_eol,
         .prompt_redraw => out.* = switch (t.flags.shell_redraws_prompt) {
