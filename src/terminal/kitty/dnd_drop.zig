@@ -530,7 +530,7 @@ pub const DropTarget = struct {
     fn dataHeader(serving: Serving) Header {
         var h: Header = .{ .buf = undefined, .len = 0 };
         const keys: response.RequestKeys = .{ .x = @intCast(serving.mime_index + 1) };
-        h.len = (std.fmt.bufPrint(&h.buf, "t=r{f}", .{keys}) catch unreachable).len;
+        h.len = (std.mem.print(&h.buf, "t=r{f}", .{keys}) catch unreachable).len;
         return h;
     }
 
@@ -672,7 +672,7 @@ pub const DropTarget = struct {
         }
 
         var header_buf: [96]u8 = undefined;
-        const header = std.fmt.bufPrint(
+        const header = std.mem.print(
             &header_buf,
             "t={c}:x={d}:y={d}:X={d}:Y={d}:o={d}",
             .{

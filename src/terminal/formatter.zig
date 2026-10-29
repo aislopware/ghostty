@@ -186,7 +186,7 @@ pub const PinMap = struct {
             alloc: Allocator,
             node: Node,
         ) Allocator.Error!void {
-            if (self.nodes.getLastOrNull()) |last| {
+            if (self.nodes.last()) |last| {
                 if (last.node == node) return;
             }
 
@@ -376,15 +376,15 @@ pub const TerminalFormatter = struct {
         writer: *std.Io.Writer,
         comptime pass: enum { before, after },
     ) std.Io.Writer.Error!void {
-        inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
-            const mode: modespkg.Mode = @enumFromInt(field.value);
+        inline for (@typeInfo(modespkg.Mode).@"enum".field_names, @typeInfo(modespkg.Mode).@"enum".field_values) |field, field_value| {
+            const mode: modespkg.Mode = @fromBackingInt(field_value);
             const after = self.content != .none and
                 (mode == .wraparound or mode == .insert);
             const current = self.terminal.modes.get(mode);
-            const default_val = @field(self.terminal.modes.default, field.name);
+            const default_val = @field(self.terminal.modes.default, field);
 
             if (after == (pass == .after) and current != default_val) {
-                const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
+                const tag: modespkg.ModeTag = @bitCast(@backingInt(mode));
                 const prefix = if (tag.ansi) "" else "?";
                 const suffix = if (current) "h" else "l";
                 try writer.print("\x1b[{s}{d}{s}", .{ prefix, tag.value, suffix });
@@ -6836,7 +6836,7 @@ test "Terminal vt formats compressed history without restoring it" {
     defer stream.deinit();
     for (0..5_000) |i| {
         var buf: [64]u8 = undefined;
-        stream.nextSlice(try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d}\x1b[0m\r\n", .{ i % 8, i }));
+        stream.nextSlice(try std.mem.print(&buf, "\x1b[3{d}mline {d}\x1b[0m\r\n", .{ i % 8, i }));
     }
 
     const format = struct {

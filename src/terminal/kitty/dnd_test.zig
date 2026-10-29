@@ -713,7 +713,7 @@ test "dnd: large data served in chunks" {
     const req = h.drop().request().?;
 
     // 3073 bytes: one full chunk plus one byte.
-    const data = [_]u8{'Z'} ** 3073;
+    const data: [3073]u8 = @splat('Z');
     try h.drop().respondData(h.writer(), req.id, &data);
     _ = try h.drop().respondEnd(h.writer(), req.id);
     const out = h.output.written();
@@ -975,7 +975,7 @@ test "dnd drag: image errors" {
     try h.setupOffer("text/plain");
     for (1..15) |i| {
         var buf: [64]u8 = undefined;
-        const meta = try std.fmt.bufPrint(&buf, "t=p:x=-{d}:y=32:X=1:Y=1", .{i});
+        const meta = try std.mem.print(&buf, "t=p:x=-{d}:y=32:X=1:Y=1", .{i});
         _ = try h.command(meta, "/wAA/w==");
     }
     try h.expectOutput("");

@@ -175,7 +175,7 @@ pub const LoadingImage = struct {
 
         // Otherwise, the payload data is guaranteed to be a path.
 
-        if (comptime builtin.os.tag != .windows) {
+        if (comptime builtin.target.os.tag != .windows) {
             if (std.mem.indexOfScalar(u8, cmd.data, 0) != null) {
                 // POSIX paths cannot contain internal nulls.
                 log.warn("invalid image path: BadPathName", .{});
@@ -204,7 +204,7 @@ pub const LoadingImage = struct {
     ) !void {
         // android does not support POSIX shared memory.
         // windows is currently unsupported, does it support shm?
-        if (comptime builtin.abi.isAndroid() or builtin.target.os.tag == .windows) {
+        if (comptime builtin.target.abi.isAndroid() or builtin.target.os.tag == .windows) {
             return error.UnsupportedMedium;
         }
 
@@ -225,7 +225,7 @@ pub const LoadingImage = struct {
         // Since we're only supporting posix then max_path_bytes should
         // be enough to stack allocate the path.
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const pathz = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.InvalidData;
+        const pathz = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return error.InvalidData;
 
         const fd = std.c.shm_open(pathz, @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })), @as(u16, 0));
         switch (std.posix.errno(fd)) {
@@ -393,7 +393,7 @@ pub const LoadingImage = struct {
         // is checked before the open. The canonical path of the opened
         // file is checked again in validatedFilePath. See kitty_windows
         // for what is refused and why.
-        if (comptime builtin.os.tag == .windows) {
+        if (comptime builtin.target.os.tag == .windows) {
             kitty_windows.checkPath(path) catch |err| {
                 log.warn("invalid image path: {}", .{err});
                 return error.InvalidData;
@@ -491,7 +491,7 @@ pub const LoadingImage = struct {
 
     /// Whether the file mediums open files with POSIX `openat` (non-blocking,
     /// never as the controlling terminal) rather than through `std.Io`.
-    const posix_open = switch (builtin.os.tag) {
+    const posix_open = switch (builtin.target.os.tag) {
         .windows, .wasi, .freestanding => false,
         else => true,
     };
@@ -521,7 +521,7 @@ pub const LoadingImage = struct {
     fn validatedFilePath(io: std.Io, file: std.Io.File, buf: []u8) ![]const u8 {
         const path = buf[0..try file.realPath(io, buf)];
 
-        if (comptime builtin.os.tag == .windows) {
+        if (comptime builtin.target.os.tag == .windows) {
             try kitty_windows.checkCanonicalPath(path);
             return path;
         }
@@ -558,7 +558,7 @@ pub const LoadingImage = struct {
         // On macOS /tmp is a symlink to /private/tmp, and the path is
         // canonical (see validatedFilePath), so files in /tmp only
         // match the canonical directory.
-        if (comptime builtin.os.tag.isDarwin()) {
+        if (comptime builtin.target.os.tag.isDarwin()) {
             if (isPathInDir("/private/tmp", path)) return true;
         }
 
@@ -660,10 +660,10 @@ pub const LoadingImage = struct {
     /// Debug function to write the data to a file. This is useful for
     /// capturing some test data for unit tests.
     pub fn debugDump(io: std.Io, self: LoadingImage) !void {
-        if (comptime builtin.mode != .Debug) @compileError("debugDump in non-debug");
+        if (comptime builtin.mode != .debug) @compileError("debugDump in non-debug");
 
         var buf: [1024]u8 = undefined;
-        const filename = try std.fmt.bufPrint(
+        const filename = try std.mem.print(
             &buf,
             "image-{s}-{s}-{d}x{d}-{}.data",
             .{
@@ -720,7 +720,7 @@ pub const LoadingImage = struct {
         };
 
         self.data.deinit(alloc);
-        self.data = .{ .items = decompressed, .capacity = decompressed.len };
+        self.data = .fromOwnedSlice(decompressed);
 
         // Make sure we note that our image is no longer compressed
         self.image.compression = .none;
@@ -809,6 +809,27 @@ pub const Image = struct {
     /// current frame), since consumers key texture caches off it.
     generation: u64 = 0,
 
+    /// Identifies the transmission that created this image. It is set to
+    /// the same stamp as `generation` when the image is added to (or
+    /// replaced in) an ImageStorage, and then never changes. Zero means
+    /// "never stored".
+    ///
+    /// Use `generation` to detect that the displayed pixels changed. Use
+    /// `transmission` to detect that the image itself was replaced. The
+    /// two differ for animations: showing another frame updates
+    /// `generation` but leaves `transmission` alone.
+    ///
+    /// ```zig
+    /// const before = storage.imageById(1).?;
+    ///
+    /// // ... the client shows another animation frame ...
+    ///
+    /// const after = storage.imageById(1).?;
+    /// after.generation != before.generation; // true: new pixels shown
+    /// after.transmission == before.transmission; // true: same image
+    /// ```
+    transmission: u64 = 0,
+
     /// Animation state, non-null once any animation command (a=f,
     /// a=a) has attached animation state to this image. Owned by the
     /// image; replaced/retransmitted images drop it, which implements
@@ -879,12 +900,24 @@ pub const Image = struct {
     }
 
     /// The pixel data that should be displayed for this image. For an
-    /// animated image this is the current animation frame; otherwise
-    /// (and for the root frame) it is the image's own data.
+    /// animated image this is the current animation frame. Otherwise,
+    /// and for the root frame, it is the image's own data.
+    ///
+    /// The result is pending when the displayed pixels have not arrived
+    /// yet. That can be true even when `data` is complete, because the
+    /// current animation frame may still be pending. Code that draws an
+    /// image should check this result rather than `data`:
+    ///
+    /// ```zig
+    /// const pixels = image.renderData().bytes() orelse return; // not ready
+    /// upload(pixels);
+    /// ```
     pub fn renderData(self: *const Image) Data {
         if (self.animation) |anim| {
             if (anim.current_index > 0) {
-                return .{ .complete = anim.frames.items[anim.current_index - 1].data };
+                const frame = anim.frames.items[anim.current_index - 1];
+                if (frame.isPending()) return .{ .pending = frame.pending_len };
+                return .{ .complete = frame.data };
             }
         }
 
@@ -892,9 +925,9 @@ pub const Image = struct {
     }
 
     /// The pixel data of the given 1-based animation frame number, or
-    /// null if the frame doesn't exist. Frame 1 (the root frame)
-    /// always exists as long as the image data is complete, even for
-    /// images without animation state.
+    /// null if the frame doesn't exist or its pixels have not arrived
+    /// yet. Frame 1 (the root frame) always exists as long as the image
+    /// data is complete, even for images without animation state.
     ///
     /// The returned slice is owned by the image (or its animation)
     /// and remains valid until the image or frame is mutated.
@@ -908,7 +941,9 @@ pub const Image = struct {
                 // image base data, so the animation frames start at frame 2.
                 const idx = number - 2;
                 if (idx >= anim.frames.items.len) return null;
-                return anim.frames.items[idx].data;
+                const frame = anim.frames.items[idx];
+                if (frame.isPending()) return null;
+                return frame.data;
             },
         }
     }
@@ -998,7 +1033,7 @@ test "shared memory names" {
 }
 
 test "image load rejects shared memory names containing NUL" {
-    if (comptime builtin.abi.isAndroid() or
+    if (comptime builtin.target.abi.isAndroid() or
         builtin.target.os.tag == .windows or
         !builtin.link_libc)
     {
@@ -1031,12 +1066,16 @@ test "image load rejects shared memory names containing NUL" {
 }
 
 test "image load accepts shared memory names without a leading slash" {
-    if (comptime builtin.abi.isAndroid() or
+    if (comptime builtin.target.abi.isAndroid() or
         builtin.target.os.tag == .windows or
         !builtin.link_libc)
     {
         return error.SkipZigTest;
     }
+
+    // FreeBSD's shm_open rejects names without a leading slash with
+    // EINVAL, so there is no such object for us to load.
+    if (comptime builtin.target.os.tag == .freebsd) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1461,7 +1500,7 @@ test "image load: temporary file outside directory prefix is rejected" {
 test "image load: temporary file in /tmp on macOS" {
     // /tmp is a symlink to /private/tmp on macOS, so the canonical path
     // of a file in it does not start with /tmp.
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1712,8 +1751,7 @@ test "image load: rgb, not compressed, relative regular file" {
             .height = 15,
             .image_id = 31,
         } },
-        .data = try std.fmt.allocPrint(
-            alloc,
+        .data = try alloc.print(
             ".zig-cache/tmp/{s}/image.data",
             .{tmp_dir.sub_path},
         ),
@@ -1731,7 +1769,7 @@ test "image load: rgb, not compressed, relative regular file" {
 }
 
 test "image load: blocklist applies to opened file after symlink swap" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const io = testing.io;
@@ -1771,7 +1809,7 @@ fn testIos() [2]std.Io {
 }
 
 test "image load: a FIFO is refused without blocking" {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1787,10 +1825,10 @@ test "image load: a FIFO is refused without blocking" {
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
     }.mkfifo;
     var fifo_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const fifo = try std.fmt.bufPrintZ(&fifo_buf, "{s}/tty-graphics-protocol.fifo", .{dir});
+    const fifo = try std.mem.printSentinel(&fifo_buf, "{s}/tty-graphics-protocol.fifo", .{dir}, 0);
     try tmp_dir.dir.symLink(io, fifo, "tty-graphics-protocol.link", .{});
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link = try std.fmt.bufPrint(&link_buf, "{s}/tty-graphics-protocol.link", .{dir});
+    const link = try std.mem.print(&link_buf, "{s}/tty-graphics-protocol.link", .{dir});
 
     for (testIos()) |load_io| for ([_][]const u8{ fifo, link }) |path| {
         for ([_]command.Transmission.Medium{ .file, .temporary_file }) |medium| {
@@ -1901,7 +1939,7 @@ test "image load: a file larger than the limit is refused before it is read" {
 }
 
 test "image load: windows UNC path is rejected before open" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1940,7 +1978,7 @@ test "image load: windows UNC path is rejected before open" {
 }
 
 test "image load: windows device namespace paths are rejected before open" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2011,7 +2049,7 @@ test "image load: windows device namespace paths are rejected before open" {
 }
 
 test "image load: windows reserved device names are rejected before open" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2051,7 +2089,7 @@ test "image load: windows reserved device names are rejected before open" {
 }
 
 test "image load: windows local file accepted in forward slash and upper case spellings" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2104,7 +2142,7 @@ test "image load: windows local file accepted in forward slash and upper case sp
 }
 
 test "image load: windows temporary file with differently spelled directory" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2156,7 +2194,7 @@ test "image load: windows temporary file with differently spelled directory" {
 }
 
 test "image load: windows canonical path check accepts a local file opened through a device spelling" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2185,7 +2223,7 @@ test "image load: windows canonical path check accepts a local file opened throu
 }
 
 test "image load: windows canonical path check rejects a file reached through a UNC share" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2204,8 +2242,7 @@ test "image load: windows canonical path check rejects a file reached through a 
     // share, which is how a junction or symlink into a share would look
     // to the post-open check. The share needs the server service and an
     // administrative token, so the test is skipped when the open fails.
-    const unc_path = try std.fmt.allocPrint(
-        alloc,
+    const unc_path = try alloc.print(
         "\\\\localhost\\{c}$\\{s}",
         .{ real_path[0], real_path[3..] },
     );
