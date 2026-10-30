@@ -191,6 +191,7 @@ jamylak
 jarred-sumner
 jcollie
 jesusvazquez
+jglanz
 jguthmiller
 jmcgover
 jmr
@@ -379,6 +380,7 @@ thomasfedb
 thoutbeckers
 ticclick
 tnagatomi
+tonypapousek
 toppk
 tothedarktowercame
 trag1c
