@@ -767,7 +767,7 @@ pub fn Stream(comptime H: type) type {
             const at_ground = u.boundaries.contains(.ground) and self.ground();
             if (u.stop == null and !at_ground) return false;
             const stop = u.stopPtr();
-            stop.consumed = @intFromPtr(end) - @intFromPtr(u.base);
+            stop.consumed = @intFromPtr(end) - @intFromPtr(u.base) - @intFromBool(u.before);
             if (at_ground) stop.reached.insert(.ground);
             return true;
         }
@@ -984,7 +984,7 @@ pub fn Stream(comptime H: type) type {
                     // used for handlers with a vtRaw hook because it
                     // dispatches the CSI directly (see nextNonUtf8).
                     if (self.parser.state == .csi_param) {
-                        offset += self.consumeCsiParams(input[offset..]);
+                        offset += self.consumeCsiParams(input[offset..], until, u);
                         if (offset >= input.len) return input.len;
                         // If we're still in csi_param then the next byte
                         // isn't a parameter byte; let nextNonUtf8 below
@@ -1143,8 +1143,15 @@ pub fn Stream(comptime H: type) type {
         /// and, if reached, the final byte (dispatching the CSI).
         /// Returns the number of bytes consumed. Stops at the first
         /// byte that isn't handled here, leaving the parser in the
-        /// csi_param state so the caller can process that byte.
-        fn consumeCsiParams(self: *Self, input: []const u8) usize {
+        /// csi_param state so the caller can process that byte: in
+        /// until mode, that is also a final byte that switches the
+        /// screen, which `nextNonUtf8` stops before.
+        fn consumeCsiParams(
+            self: *Self,
+            input: []const u8,
+            comptime until: bool,
+            u: Until.Arg(until),
+        ) usize {
             const p = &self.parser;
             assert(p.state == .csi_param);
 
@@ -1184,6 +1191,8 @@ pub fn Stream(comptime H: type) type {
                         p.param_acc = acc;
                         p.param_acc_idx = acc_idx;
                         p.params_idx = idx;
+                        if (comptime until) if (u.boundaries.contains(.screen_switch) and
+                            self.screenSwitch(c) != null) return offset;
                         self.csiDispatchFinal(c);
                         return offset + 1;
                     },
@@ -1385,6 +1394,16 @@ pub fn Stream(comptime H: type) type {
         ) void {
             assert(self.parser.state != .ground);
 
+            // A screen switch stops before its final byte, unprocessed.
+            if (comptime until) if (self.parser.state == .csi_param and
+                u.boundaries.contains(.screen_switch))
+            {
+                if (self.screenSwitch(c)) |mode| {
+                    u.screenSwitch(mode, c);
+                    return;
+                }
+            };
+
             // Fast path for CSI entry.
             if (self.parser.state == .escape and c == '[') {
                 self.parser.state = .csi_entry;
@@ -1548,6 +1567,36 @@ pub fn Stream(comptime H: type) type {
 
             if (comptime debug) log.info("action: {f}", .{Parser.Action{ .csi_dispatch = action }});
             self.csiDispatch(action);
+        }
+
+        /// The mode (47, 1047 or 1049) of a screen switch `c` would
+        /// dispatch, with the parser in `csi_param`, or null. It reads the
+        /// parser's state as the dispatch would (`csiDispatchFinal`,
+        /// `Parser`'s `csi_dispatch` and the `h` and `l` commands of
+        /// `csiDispatch`): a mode set or reset with the `?` marker alone,
+        /// not dropped for too many parameters or for a colon, and the
+        /// first of those modes among its parameters, which switch in
+        /// their order.
+        fn screenSwitch(self: *const Self, c: u8) ?u16 {
+            if (c != 'h' and c != 'l') return null;
+            const p = &self.parser;
+            if (p.params_idx >= Parser.MAX_PARAMS) return null;
+            if (p.params_sep.count() > 0) return null;
+            if (p.intermediates_idx != 1 or p.intermediates[0] != '?') return null;
+            const last: []const u16 = if (p.param_acc_idx > 0) &.{p.param_acc} else &.{};
+            for ([_][]const u16{ p.params[0..p.params_idx], last }) |params| {
+                for (params) |value| {
+                    const mode = modes.modeFromInt(value, false) orelse continue;
+                    switch (mode) {
+                        .alt_screen_legacy,
+                        .alt_screen,
+                        .alt_screen_save_cursor_clear_enter,
+                        => return value,
+                        else => {},
+                    }
+                }
+            }
+            return null;
         }
 
         inline fn print(self: *Self, c: u21) void {
@@ -3425,6 +3474,22 @@ pub const Boundary = enum {
     /// OSC, including ones with a number the handler does not know.
     osc_end,
 
+    /// The final byte of a mode set or reset (`CSI ? … h` or `l`) of
+    /// mode 47, 1047 or 1049, which switch between the primary and the
+    /// alternate screen. Unlike every other boundary, the stop lands
+    /// right before the byte, which is left unconsumed: everything the
+    /// program wrote before the switch is processed, a control inside
+    /// the sequence too, and the switch itself is not. So the caller sees
+    /// the screen the program is about to switch away from, as it was
+    /// left, found by the same parse that will switch it. `Stop.screen`
+    /// says which mode and which way.
+    ///
+    /// The stop lands on the byte whether or not the screen would change
+    /// (the alternate screen set again, say). The next call starts with
+    /// the byte and would stop on it again, so feed it without this
+    /// boundary in the set, or with `nextSlice`.
+    screen_switch,
+
     /// A set of boundaries to stop at.
     pub const Set = std.EnumSet(Boundary);
 
@@ -3472,7 +3537,8 @@ pub const Boundary = enum {
     /// Where `Stream.nextSliceUntil` stopped and why.
     pub const Stop = struct {
         /// The number of input bytes consumed, including the byte that
-        /// reached the boundary. This is 0 when the stream was already at
+        /// reached the boundary, except for `screen_switch`, whose byte
+        /// is not consumed. This is 0 when the stream was already at
         /// ground and `.ground` was requested.
         consumed: usize,
 
@@ -3509,6 +3575,9 @@ pub const Boundary = enum {
         /// Set when `reached` contains a string end.
         end: ?End = null,
 
+        /// Set when `reached` contains `screen_switch`.
+        screen: ?Screen = null,
+
         pub const Start = struct {
             kind: StringKind,
             introducer: Introducer,
@@ -3523,6 +3592,16 @@ pub const Boundary = enum {
             reason: EndReason,
 
             /// The byte that ended the string, such as ESC, BEL or 0x9C.
+            byte: u8,
+        };
+
+        pub const Screen = struct {
+            /// The first of modes 47, 1047 and 1049 among the sequence's
+            /// parameters, the one that switches the screen.
+            mode: u16,
+
+            /// The final byte: `h` sets the mode (to the alternate
+            /// screen), `l` resets it (back to the primary).
             byte: u8,
         };
     };
@@ -3544,6 +3623,9 @@ const Until = struct {
 
     /// The stop being built. Null until a byte reaches a boundary.
     stop: ?Boundary.Stop = null,
+
+    /// The stopping byte is not consumed: a `screen_switch` stop.
+    before: bool = false,
 
     /// The string kind a parser state belongs to, or null for a state
     /// that is not inside a control string. The DCS states form one
@@ -3622,6 +3704,15 @@ const Until = struct {
             },
             .byte = c,
         };
+    }
+
+    /// Note that `c`, which the stream leaves unprocessed, would end a
+    /// mode set that switches the screen.
+    fn screenSwitch(self: *Until, mode: u16, c: u8) void {
+        const stop = self.stopPtr();
+        stop.reached.insert(.screen_switch);
+        stop.screen = .{ .mode = mode, .byte = c };
+        self.before = true;
     }
 
     fn stopPtr(self: *Until) *Boundary.Stop {
@@ -5856,7 +5947,7 @@ const dcs_set: Boundary.Set = .initMany(&.{ .dcs_start, .dcs_end });
 const osc_set: Boundary.Set = .initMany(&.{ .osc_start, .osc_end });
 /// Every string boundary, without ground.
 const strings_set: Boundary.Set = apc_set.unionWith(dcs_set).unionWith(osc_set);
-/// Every boundary.
+/// Every boundary a stop lands after: all but `screen_switch`.
 const all_set: Boundary.Set = strings_set.unionWith(.initOne(.ground));
 
 /// Expected result of feeding one byte to a stream inside an APC or an
@@ -6739,6 +6830,7 @@ fn differential(input: []const u8) !void {
     var rem = input;
     while (rem.len > 0) {
         var set = all_set;
+        set.insert(.screen_switch);
         if (until.ground()) set.remove(.ground);
         const stop = until.nextSliceUntil(rem, set) orelse {
             reference.nextSlice(rem);
@@ -6750,6 +6842,20 @@ fn differential(input: []const u8) !void {
         try testing.expect(stop.consumed <= rem.len);
         reference.nextSlice(rem[0..stop.consumed]);
         rem = rem[stop.consumed..];
+
+        // A screen switch stops in its CSI, before the final byte it
+        // names, which the next call would stop before again.
+        if (stop.screen) |screen| {
+            try testing.expect(stop.reached.eql(.initOne(.screen_switch)));
+            try testing.expectEqual(Parser.State.csi_param, until.parser.state);
+            try testing.expectEqual(screen.byte, rem[0]);
+            try testing.expect(screen.mode == 47 or screen.mode == 1047 or screen.mode == 1049);
+            try testing.expectEqual(reference.parser.state, until.parser.state);
+            until.nextSlice(rem[0..1]);
+            reference.nextSlice(rem[0..1]);
+            rem = rem[1..];
+            continue;
+        }
 
         try testing.expectEqual(reference.parser.state, until.parser.state);
         try testing.expectEqual(reference.utf8decoder.state, until.utf8decoder.state);
@@ -6825,6 +6931,91 @@ fn logsErr(input: []const u8) bool {
     return probe.handler.csi_t_no_params;
 }
 
+/// The parameters (and what precedes the final byte) of mode sets that
+/// switch the screen, of ones that look like it and do not, and of ones
+/// written the ways a parse accepts: among other modes, with a control,
+/// an ignored byte or an 8-bit CSI inside.
+const screen_params = [_][]const u8{
+    "1049",                                                   "1047",
+    "47",                                                     "25;1049",
+    "1049;47",                                                "2004;47;1049",
+    "01049",                                                  "10\n49",
+    "104\xa39",                                               "10\x7f49",
+    "10\x0049",                                               "\x9b?1049",
+    "1049:1",                                                 "1049$",
+    "25",                                                     "10490",
+    "4;7",                                                    "0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;1049",
+    "0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;1049", "1049\x18",
+};
+
+/// Notes, per byte fed, whether the byte dispatched a set or reset of a
+/// mode that switches the screen.
+const ScreenSwitchProbe = struct {
+    switched: bool = false,
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn vt(
+        self: *@This(),
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) void {
+        switch (action) {
+            .set_mode, .reset_mode => switch (value.mode) {
+                .alt_screen_legacy,
+                .alt_screen,
+                .alt_screen_save_cursor_clear_enter,
+                => self.switched = true,
+                else => {},
+            },
+            else => {},
+        }
+    }
+};
+
+test "stream: nextSliceUntil screen switch stops right before the byte that switches" {
+    const S = Stream(ScreenSwitchProbe);
+    for (screen_params) |params| for ("hl") |final| {
+        var buf: [96]u8 = undefined;
+        const input = try std.fmt.bufPrint(&buf, "a\x1b[?{s}{c}b", .{ params, final });
+
+        // Where the parse dispatches a switch, a byte at a time.
+        var switches: [4]usize = undefined;
+        var count: usize = 0;
+        {
+            var s: S = .init(.{ .handler = .{} });
+            defer s.deinit();
+            for (input, 0..) |c, i| {
+                s.handler.switched = false;
+                s.nextSlice(&.{c});
+                if (s.handler.switched) {
+                    switches[count] = i;
+                    count += 1;
+                }
+            }
+        }
+
+        // Where the stops land, and the handler has not switched yet.
+        var s: S = .init(.{ .handler = .{} });
+        defer s.deinit();
+        var rem: []const u8 = input;
+        var stops: usize = 0;
+        while (s.nextSliceUntil(rem, .initOne(.screen_switch))) |stop| {
+            try testing.expect(!s.handler.switched);
+            const at = input.len - rem.len + stop.consumed;
+            try testing.expect(stops < count);
+            try testing.expectEqual(switches[stops], at);
+            try testing.expectEqual(final, stop.screen.?.byte);
+            stops += 1;
+            s.nextSlice(input[at..][0..1]);
+            try testing.expect(s.handler.switched);
+            s.handler.switched = false;
+            rem = input[at + 1 ..];
+        }
+        try testing.expectEqual(count, stops);
+    };
+}
+
 test "stream: nextSliceUntil differential on generated streams" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed);
@@ -6833,7 +7024,7 @@ test "stream: nextSliceUntil differential on generated streams" {
     // Pieces a generated stream is made of. Weighted toward control
     // strings and the bytes that end one, with enough text to cross
     // the 4096-byte decode chunk.
-    const Piece = enum { text, utf8, csi, osc, osc_cut, dcs, dcs_cut, apc_esc, apc_c1, apc_cut, raw, big_text, big_apc };
+    const Piece = enum { text, utf8, csi, screen, osc, osc_cut, dcs, dcs_cut, apc_esc, apc_c1, apc_cut, raw, big_text, big_apc };
     const terminators = [_][]const u8{ "\x1b\\", "\x9c", "\x18", "\x1a", "\x9f", "\x90", "\x9b", "\x85", "\x1b[m", "\x1b_", "\x9d", "\x07" };
 
     var buf: std.ArrayList(u8) = .empty;
@@ -6860,6 +7051,11 @@ test "stream: nextSliceUntil differential on generated streams" {
                         rand.intRangeAtMost(u8, 0, 99),
                         "mHJKABCDhlr"[rand.uintLessThan(usize, 11)],
                     }));
+                },
+                .screen => {
+                    try buf.appendSlice(alloc, "\x1b[?");
+                    try buf.appendSlice(alloc, screen_params[rand.uintLessThan(usize, screen_params.len)]);
+                    try buf.append(alloc, "hl"[rand.uintLessThan(usize, 2)]);
                 },
                 .osc => {
                     var seq: [32]u8 = undefined;

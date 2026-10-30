@@ -1402,15 +1402,18 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
 
     // Update tracked pins within the region since their rows moved up
     // by one. The cursor's own pin is skipped because the cursor stays
-    // at the region bottom (the new blank row).
+    // at the region bottom (the new blank row). A pin on the erased top
+    // row is garbage, as in PageList.eraseRowBounded.
     const pin_keys = self.pages.tracked_pins.keys();
     for (pin_keys) |p| {
         if (p.node != pin.node or
             p == pin or
             p.y < pin.y - limit or
             p.y > pin.y) continue;
+        if (p.y == pin.y - limit) p.garbage = true;
         if (p.y == 0) p.x = 0 else p.y -= 1;
     }
+    self.pages.viewport_pin.garbage = false;
 
     // The cursor pin is unchanged, but the Row structure at the pin
     // position now contains the blank row, so we need to refresh our
@@ -5607,6 +5610,31 @@ test "Screen: cursorScrollRegionUp moves selection" {
         defer alloc.free(contents);
         try testing.expectEqualStrings("2EFGH\n3IJKL\n\n4MNOP\n5QRST", contents);
     }
+}
+
+test "Screen: cursorScrollRegionUp marks a pin on the erased row as garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST");
+
+    const erased = try s.pages.trackPin(s.pages.pin(.{ .active = .{ .y = 1 } }).?);
+    defer s.pages.untrackPin(erased);
+    const moved = try s.pages.trackPin(s.pages.pin(.{ .active = .{ .y = 2 } }).?);
+    defer s.pages.untrackPin(moved);
+
+    // A region of rows 1-3: row 1 is erased and row 2 moves up into it.
+    s.cursorAbsolute(0, 3);
+    try s.cursorScrollRegionUp(2);
+
+    try testing.expect(erased.garbage);
+    try testing.expect(!moved.garbage);
+    try testing.expectEqual(point.Point{ .active = .{ .y = 1 } }, s.pages.pointFromPin(.active, moved.*).?);
+    try testing.expect(!s.cursor.page_pin.garbage);
+    try testing.expect(!s.pages.viewport_pin.garbage);
 }
 
 test "Screen: cursorScrollRegionUp region spans pages" {
@@ -12797,6 +12825,31 @@ test "Screen: cursorDownScroll no scrollback recycled row has default metadata" 
         try testing.expect(!rac.row.wrap_continuation);
         try testing.expectEqual(.none, rac.row.semantic_prompt);
     }
+}
+
+test "Screen: cursorDownScroll no scrollback marks a pin on the erased row as garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
+
+    const erased = try s.pages.trackPin(s.pages.pin(.{ .active = .{} }).?);
+    defer s.pages.untrackPin(erased);
+    const moved = try s.pages.trackPin(s.pages.pin(.{ .active = .{ .y = 1 } }).?);
+    defer s.pages.untrackPin(moved);
+
+    // With no scrollback the top row is erased, not kept as history.
+    s.cursorAbsolute(0, 2);
+    try s.cursorDownScroll();
+
+    try testing.expect(erased.garbage);
+    try testing.expect(!moved.garbage);
+    try testing.expectEqual(point.Point{ .active = .{} }, s.pages.pointFromPin(.active, moved.*).?);
+    try testing.expect(!s.cursor.page_pin.garbage);
+    try testing.expect(!s.pages.viewport_pin.garbage);
 }
 
 test "Screen: cursorDownScroll single row no scrollback resets metadata" {

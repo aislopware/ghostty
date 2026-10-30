@@ -465,6 +465,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * including ones the terminal does not understand.
    */
   GHOSTTY_TERMINAL_BOUNDARY_OSC_END = 1 << 6,
+
+  /**
+   * The final byte of a mode set or reset (`CSI ? ... h` or `l`) of mode
+   * 47, 1047 or 1049, which switch between the primary and the alternate
+   * screen. Unlike every other boundary, the stop lands right before the
+   * byte, which is not consumed: everything the program wrote before the
+   * switch is processed, a control inside the sequence too, and the
+   * switch itself is not. So you can read the screen the program is about
+   * to switch away from, as it left it. GhosttyTerminalWriteStop.mode and
+   * GhosttyTerminalWriteStop.byte say which mode and which way.
+   *
+   * The stop lands on the byte whether or not the screen would change.
+   * The next call starts with that byte and would stop on it again, so
+   * write it without this boundary, or with ghostty_terminal_vt_write().
+   */
+  GHOSTTY_TERMINAL_BOUNDARY_SCREEN_SWITCH = 1 << 7,
   GHOSTTY_TERMINAL_BOUNDARY_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalBoundary;
 
@@ -593,8 +609,9 @@ typedef struct {
 
   /**
    * Number of input bytes consumed, including the byte that reached the
-   * boundary. This is 0 when the stream was already at ground and you
-   * asked for GHOSTTY_TERMINAL_BOUNDARY_GROUND.
+   * boundary, except for GHOSTTY_TERMINAL_BOUNDARY_SCREEN_SWITCH, whose
+   * byte is not consumed. This is 0 when the stream was already at ground
+   * and you asked for GHOSTTY_TERMINAL_BOUNDARY_GROUND.
    */
   size_t consumed;
 
@@ -639,9 +656,19 @@ typedef struct {
 
   /**
    * The byte that started or ended the string, such as `]`, 0x90, ESC or
-   * BEL. Valid when `reached` has a START or END flag.
+   * BEL. Valid when `reached` has a START or END flag. With
+   * GHOSTTY_TERMINAL_BOUNDARY_SCREEN_SWITCH, the final byte left
+   * unconsumed: `h` sets the mode (to the alternate screen), `l` resets it
+   * (back to the primary).
    */
   uint8_t byte;
+
+  /**
+   * The first of modes 47, 1047 and 1049 among the sequence's parameters,
+   * the one that switches the screen. Valid when `reached` has
+   * GHOSTTY_TERMINAL_BOUNDARY_SCREEN_SWITCH; 0 otherwise.
+   */
+  uint16_t mode;
 } GhosttyTerminalWriteStop;
 
 /**
@@ -3510,6 +3537,18 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
  * with `consumed` set to 0. If you keep asking for ground with the same
  * input, you never make progress. After a ground stop, write the next
  * bytes without the GROUND flag, or with ghostty_terminal_vt_write().
+ *
+ * ## Screen switches
+ *
+ * A GHOSTTY_TERMINAL_BOUNDARY_SCREEN_SWITCH stop lands before the final
+ * byte of a mode set or reset of mode 47, 1047 or 1049, and leaves that
+ * byte unconsumed, so the screen the program switches away from can be
+ * read as it left it. For `ESC [ ? 1 0 4 9 h` the stop consumes
+ * `ESC [ ? 1 0 4 9`, `mode` is 1049 and `byte` is `h`. The parse finds
+ * the switch however the program wrote it: split across writes, among
+ * other modes, or with a control or an ignored byte inside the sequence.
+ * Write the `h` without the SCREEN_SWITCH flag, which would stop on it
+ * again, and go on from the byte after it.
  *
  * @param terminal The terminal handle (must not be NULL)
  * @param data Pointer to the data to write, or NULL when len is zero

@@ -970,8 +970,12 @@ pub const ScreenFormatter = struct {
             // A space sets the wrap. Where the saved cursor may be replaced,
             // the space is saved with the wrap (DECSC), erased (ECH, which
             // clears the wrap) and the cursor restored (DECRC), which sets
-            // the wrap again over a blank cell.
-            try writer.writeAll(if (may_save) " \x1b7\x1b[X\x1b8" else " ");
+            // the wrap again over a blank cell. Not on a row that wraps into
+            // the next, which ECH would end: the replay wrote its last
+            // column as a space to wrap from, and a blank cell before that
+            // reads the same as a space, so the space stays.
+            const erase = may_save and !rac.row.wrap;
+            try writer.writeAll(if (erase) " \x1b7\x1b[X\x1b8" else " ");
             return;
         }
         try cell_formatter.format(writer);
@@ -6806,6 +6810,58 @@ test "Screen vt with cursor position" {
     // Extra bytes (cursor position) map to last content pin
     for (content_len..output.len) |i| {
         try testing.expectEqual(node, pin_map.get(i).?.node);
+    }
+}
+
+test "Terminal vt saved cursor with a pending wrap on a row that wraps keeps the wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        // The saved cursor waits to wrap on the last column of row 0,
+        // whose cells scrolled away, and row 0 then wraps into row 1 from
+        // that blank column.
+        "abcd\x1b7\x1b[S x",
+        // Row 0 wraps, and the saved cursor waits to wrap at the right
+        // margin over a cell erased since (EL 1 keeps the row's wrap).
+        "\x1b[1;4Hab\x1b[?69h\x1b[1;3s\x1b[1;3Hc\x1b7\x1b[1K\x1b[3;1H",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+        const saved = source.screens.active.saved_cursor.?;
+        try testing.expect(saved.pending_wrap);
+        const row = source.screens.active.pages.pin(.{ .active = .{} }).?.rowAndCell().row;
+        try testing.expect(row.wrap);
+
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: TerminalFormatter = .init(&source, .vt);
+        formatter.extra = .all;
+        formatter.opts.unwrap = true;
+        formatter.opts.trim = false;
+        try formatter.format(&builder.writer);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 4, .rows = 3 });
+        defer target.deinit(alloc);
+        var target_stream = target.vtStream();
+        defer target_stream.deinit();
+        target_stream.nextSlice(builder.writer.buffered());
+
+        for (0..3) |y| {
+            const at: point.Point = .{ .active = .{ .y = @intCast(y) } };
+            const want = source.screens.active.pages.pin(at).?.rowAndCell().row;
+            const got = target.screens.active.pages.pin(at).?.rowAndCell().row;
+            try testing.expectEqual(want.wrap, got.wrap);
+            try testing.expectEqual(want.wrap_continuation, got.wrap_continuation);
+        }
+        const got = target.screens.active.saved_cursor.?;
+        try testing.expectEqual(saved.x, got.x);
+        try testing.expectEqual(saved.y, got.y);
+        try testing.expect(got.pending_wrap);
     }
 }
 

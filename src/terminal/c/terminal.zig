@@ -1131,6 +1131,7 @@ pub const Boundary = enum(c_int) {
     dcs_end = 1 << 4,
     osc_start = 1 << 5,
     osc_end = 1 << 6,
+    screen_switch = 1 << 7,
     _,
 
     comptime {
@@ -1196,6 +1197,7 @@ pub const WriteStop = extern struct {
     introducer: StringIntroducer = .esc,
     end: StringEnd = .st_esc,
     byte: u8 = 0,
+    mode: u16 = 0,
 };
 
 pub fn vt_write_until(
@@ -1239,6 +1241,11 @@ pub fn vt_write_until(
         out.kind = end.kind;
         out.end = end.reason;
         out.byte = end.byte;
+    }
+    // A screen switch stops in a CSI, never at a string's start or end.
+    if (stop.screen) |screen| {
+        out.mode = screen.mode;
+        out.byte = screen.byte;
     }
 
     return .success;
@@ -3723,6 +3730,7 @@ test "vt_write_until result contract" {
         .introducer = .c1,
         .end = .aborted,
         .byte = 99,
+        .mode = 99,
     };
 
     var stop: WriteStop = stale;
@@ -3739,7 +3747,7 @@ test "vt_write_until result contract" {
     );
     try testing.expectEqual(WriteStop{}, stop);
 
-    for ([_]u32{ 0, 1 << 7, 1 << 31, ground | 1 << 7 }) |bits| {
+    for ([_]u32{ 0, 1 << 8, 1 << 31, ground | 1 << 8 }) |bits| {
         stop = stale;
         try testing.expectEqual(
             Result.invalid_value,
@@ -3785,6 +3793,66 @@ test "vt_write_until result contract" {
         vt_write_until(t, null, 0, apc_start, &stop),
     );
     try testing.expectEqual(WriteStop{}, stop);
+}
+
+test "vt_write_until screen switch stops before the switch" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    const screen_switch: u32 = @backingInt(Boundary.screen_switch);
+    const screens = &t.?.terminal.screens;
+
+    // The line feed inside the sequence runs before the switch, on the
+    // primary screen, and the ignored 0xA3 leaves mode 1049.
+    const input = "ab\x1b[?10\n4\xa39hcd";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, screen_switch, &stop),
+    );
+    try testing.expectEqual(@as(usize, input.len - 3), stop.consumed);
+    try testing.expectEqual(screen_switch, stop.reached);
+    try testing.expectEqual(@as(u16, 1049), stop.mode);
+    try testing.expectEqual(@as(u8, 'h'), stop.byte);
+    try testing.expectEqual(.primary, screens.active_key);
+    try testing.expectEqual(@as(size.CellCountInt, 1), screens.active.cursor.y);
+
+    // The next call stops on the same byte again, consuming nothing.
+    const rest = input[stop.consumed..];
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, rest.ptr, rest.len, screen_switch, &stop),
+    );
+    try testing.expectEqual(@as(usize, 0), stop.consumed);
+    vt_write(t, rest.ptr, 1);
+    try testing.expectEqual(.alternate, screens.active_key);
+    vt_write(t, rest.ptr + 1, rest.len - 1);
+
+    // Leaving stops on `l`; a mode set a colon drops, or of another mode,
+    // does not stop.
+    const leave = "\x1b[?1049l\x1b[?1049:1h\x1b[?2004h";
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, leave, leave.len, screen_switch, &stop),
+    );
+    try testing.expectEqual(@as(usize, 7), stop.consumed);
+    try testing.expectEqual(@as(u16, 1049), stop.mode);
+    try testing.expectEqual(@as(u8, 'l'), stop.byte);
+    try testing.expectEqual(.alternate, screens.active_key);
+    vt_write(t, leave.ptr + 7, 1);
+    try testing.expectEqual(.primary, screens.active_key);
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until(t, leave.ptr + 8, leave.len - 8, screen_switch, &stop),
+    );
+    try testing.expectEqual(WriteStop{ .consumed = leave.len - 8 }, stop);
+    try testing.expectEqual(.primary, screens.active_key);
 }
 
 test "vt_write_until kitty apc start and end" {
