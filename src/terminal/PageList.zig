@@ -5227,12 +5227,18 @@ pub fn eraseRow(
     fastmem.rotateOnce(Row, rows[pn.y..node.rows()]);
 
     // We adjust the tracked pins in this page, moving up any that were below
-    // the removed row.
+    // the removed row. A pin on the removed row has nothing left to point
+    // at: it stays where it is, on the row that moved up in its place, and
+    // is marked as garbage, like a pin on a row eraseRows removes.
     {
         const pin_keys = self.tracked_pins.keys();
         for (pin_keys) |p| {
-            if (p.node == node and p.y > pn.y) p.y -= 1;
+            if (p.node != node) continue;
+            if (p.y > pn.y) p.y -= 1 else if (p.y == pn.y) p.garbage = true;
         }
+
+        // Our viewport pin is never garbage
+        self.viewport_pin.garbage = false;
     }
 
     // If we have a pinned viewport, we need to adjust for active area.
@@ -5369,13 +5375,15 @@ pub fn eraseRowBounded(
             }
         }
 
-        // Update pins in the shifted region.
+        // Update pins in the shifted region. A pin on the erased row is
+        // garbage, as in eraseRow.
         const pin_keys = self.tracked_pins.keys();
         for (pin_keys) |p| {
             if (p.node == node and
                 p.y >= pn.y and
                 p.y <= pn.y + limit)
             {
+                if (p.y == pn.y) p.garbage = true;
                 if (p.y == 0) {
                     p.x = 0;
                 } else {
@@ -5383,6 +5391,7 @@ pub fn eraseRowBounded(
                 }
             }
         }
+        self.viewport_pin.garbage = false;
 
         return;
     }
@@ -5419,6 +5428,7 @@ pub fn eraseRowBounded(
         const pin_keys = self.tracked_pins.keys();
         for (pin_keys) |p| {
             if (p.node == node and p.y >= pn.y) {
+                if (p.y == pn.y) p.garbage = true;
                 if (p.y == 0) {
                     p.x = 0;
                 } else {
@@ -5426,6 +5436,7 @@ pub fn eraseRowBounded(
                 }
             }
         }
+        self.viewport_pin.garbage = false;
     }
 
     while (node.next) |next| {
@@ -14525,17 +14536,22 @@ test "PageList eraseRowBounded less than full row" {
     try testing.expect(s.isDirty(.{ .active = .{ .x = 0, .y = 6 } }));
     try testing.expect(s.isDirty(.{ .active = .{ .x = 0, .y = 7 } }));
 
+    // The pin on the erased row is garbage.
     try testing.expectEqual(s.pages.first.?, p_top.node);
     try testing.expectEqual(@as(usize, 4), p_top.y);
     try testing.expectEqual(@as(usize, 0), p_top.x);
+    try testing.expect(p_top.garbage);
 
     try testing.expectEqual(s.pages.first.?, p_bot.node);
     try testing.expectEqual(@as(usize, 7), p_bot.y);
     try testing.expectEqual(@as(usize, 0), p_bot.x);
+    try testing.expect(!p_bot.garbage);
 
     try testing.expectEqual(s.pages.first.?, p_out.node);
     try testing.expectEqual(@as(usize, 9), p_out.y);
     try testing.expectEqual(@as(usize, 0), p_out.x);
+    try testing.expect(!p_out.garbage);
+    try testing.expect(!s.viewport_pin.garbage);
 }
 
 test "PageList eraseRowBounded with pin at top" {
@@ -14561,6 +14577,8 @@ test "PageList eraseRowBounded with pin at top" {
     try testing.expectEqual(s.pages.first.?, p_top.node);
     try testing.expectEqual(@as(usize, 0), p_top.y);
     try testing.expectEqual(@as(usize, 0), p_top.x);
+    try testing.expect(p_top.garbage);
+    try testing.expect(!s.viewport_pin.garbage);
 }
 
 test "PageList eraseRowBounded full rows single page" {
@@ -14651,25 +14669,31 @@ test "PageList eraseRowBounded full rows two pages" {
         .y = @intCast(y),
     } }));
 
-    // In page in first page is shifted
+    // In page in first page is shifted, and garbage: it was on the
+    // erased row
     try testing.expectEqual(s.pages.last.?.prev.?, p_first.node);
     try testing.expectEqual(@as(usize, p_first.node.rows() - 2), p_first.y);
     try testing.expectEqual(@as(usize, 0), p_first.x);
+    try testing.expect(p_first.garbage);
 
     // Out page in first page should not be shifted
     try testing.expectEqual(s.pages.last.?.prev.?, p_first_out.node);
     try testing.expectEqual(@as(usize, p_first_out.node.rows() - 2), p_first_out.y);
     try testing.expectEqual(@as(usize, 0), p_first_out.x);
+    try testing.expect(!p_first_out.garbage);
 
     // In page is shifted
     try testing.expectEqual(s.pages.last.?, p_in.node);
     try testing.expectEqual(@as(usize, 2), p_in.y);
     try testing.expectEqual(@as(usize, 0), p_in.x);
+    try testing.expect(!p_in.garbage);
 
     // Out page is not shifted
     try testing.expectEqual(s.pages.last.?, p_out.node);
     try testing.expectEqual(@as(usize, 4), p_out.y);
     try testing.expectEqual(@as(usize, 0), p_out.x);
+    try testing.expect(!p_out.garbage);
+    try testing.expect(!s.viewport_pin.garbage);
 }
 
 test "PageList eraseRow hyperlink-dense row crosses page boundary" {
@@ -20766,6 +20790,32 @@ test "PageList split preserves hyperlinks" {
         const link = second_page.hyperlink_set.get(second_page.memory, link_id);
         try testing.expectEqualStrings("https://example.com", link.uri.slice(second_page.memory));
     }
+}
+
+test "PageList eraseRow marks a pin on the erased row as garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+
+    const erased = try s.trackPin(s.pin(.{ .active = .{ .x = 2 } }).?);
+    defer s.untrackPin(erased);
+    const moved = try s.trackPin(s.pin(.{ .active = .{ .y = 1 } }).?);
+    defer s.untrackPin(moved);
+
+    try s.eraseRow(.{ .active = .{} });
+
+    // The erased row is gone, so its pin points at nothing: it stays in
+    // place, on the row that moved up, and is garbage.
+    try testing.expect(erased.garbage);
+    try testing.expectEqual(point.Point{ .active = .{ .x = 2 } }, s.pointFromPin(.active, erased.*).?);
+
+    // The row below moved up with its pin.
+    try testing.expect(!moved.garbage);
+    try testing.expectEqual(point.Point{ .active = .{} }, s.pointFromPin(.active, moved.*).?);
+
+    try testing.expect(!s.viewport_pin.garbage);
 }
 
 test "PageList eraseRow recycled row has default metadata" {
