@@ -770,13 +770,19 @@ pub const ScreenFormatter = struct {
                 if (self.screen.saved_cursor) |saved| try self.formatSavedCursor(t, saved, writer);
             }
             const cursor = &self.screen.cursor;
-            try self.formatCursorAt(
+            const may_save = self.savesAsIs(cursor.x, cursor.y);
+            const placed = if (self.terminal) |t|
+                self.cursor_origin != null and
+                    try self.formatCursorOutside(t, writer, cursor.*, may_save)
+            else
+                false;
+            if (!placed) try self.formatCursorAt(
                 writer,
                 cursor.x,
                 cursor.y,
                 cursor.pending_wrap,
                 self.cursor_origin,
-                self.savesAsIs(cursor.x, cursor.y),
+                may_save,
             );
         }
 
@@ -874,29 +880,14 @@ pub const ScreenFormatter = struct {
     ) std.Io.Writer.Error!void {
         const origin = origin_mode orelse CursorOrigin{};
 
-        // The column a print leaves a pending wrap in: the right margin,
-        // or past it the last column, as `Terminal.print` reads it. The
-        // margins are already set when the cursor is formatted.
-        const right_edge: size.CellCountInt = if (self.terminal) |t|
-            if (x <= t.scrolling_region.right) t.scrolling_region.right else self.screen.pages.cols - 1
-        else
-            self.screen.pages.cols - 1;
-
         // If we don't have pending wrap, then we can just use CUP.
-        if (!pending_wrap or x != right_edge) {
+        const pin = self.pendingWrapPin(x, y, pending_wrap) orelse {
             try writer.print("\x1b[{d};{d}H", .{ y -| origin.y + 1, x -| origin.x + 1 });
             return;
-        }
+        };
 
         // Pending wrap, we can't use CUP because it resets pending wrap.
-        const pin = self.screen.pages.pin(.{ .active = .{ .x = x, .y = y } }) orelse {
-            try writer.print("\x1b[{d};{d}H", .{ y -| origin.y + 1, x -| origin.x + 1 });
-            return;
-        };
-        const start_x = switch (pin.rowAndCell().cell.wide) {
-            .spacer_tail => x - 1,
-            .narrow, .wide, .spacer_head => x,
-        };
+        const start_x = pendingWrapStart(pin, x);
 
         // Prompt content on a row with no prompt flag: only OSC 133 P gives
         // a cursor prompt content, and P flags the cursor's row. So it is
@@ -912,11 +903,54 @@ pub const ScreenFormatter = struct {
             "\x1b[{d};{d}H",
             .{ y -| origin.y + 1, start_x -| origin.x + 1 },
         );
+        try self.reprintPendingWrap(writer, pin, x, start_x, primed, may_save);
+    }
 
+    /// The cell a pending wrap at (`x`, `y`) is set again by reprinting,
+    /// or null when there is no pending wrap to set. A pending wrap counts
+    /// only at the column a print leaves one in: the right margin, or past
+    /// it the last column, as `Terminal.print` reads it. The margins are
+    /// already set when the cursor is formatted.
+    fn pendingWrapPin(
+        self: ScreenFormatter,
+        x: size.CellCountInt,
+        y: size.CellCountInt,
+        pending_wrap: bool,
+    ) ?Pin {
+        const right_edge: size.CellCountInt = if (self.terminal) |t|
+            if (x <= t.scrolling_region.right) t.scrolling_region.right else self.screen.pages.cols - 1
+        else
+            self.screen.pages.cols - 1;
+        if (!pending_wrap or x != right_edge) return null;
+        return self.screen.pages.pin(.{ .active = .{ .x = x, .y = y } });
+    }
+
+    /// The column the cell at `pin` (column `x`) is reprinted from: a wide
+    /// character's own, when `pin` is its tail.
+    fn pendingWrapStart(pin: Pin, x: size.CellCountInt) size.CellCountInt {
+        return switch (pin.rowAndCell().cell.wide) {
+            .spacer_tail => x - 1,
+            .narrow, .wide, .spacer_head => x,
+        };
+    }
+
+    /// With the cursor at `start_x` on the row of `pin`, print the cell at
+    /// `pin` (column `x`) again, which leaves the cursor at `x` with a
+    /// pending wrap. See `formatCursorAt` for `primed` and `may_save`.
+    fn reprintPendingWrap(
+        self: ScreenFormatter,
+        writer: *std.Io.Writer,
+        pin: Pin,
+        x: size.CellCountInt,
+        start_x: size.CellCountInt,
+        primed: bool,
+        may_save: bool,
+    ) std.Io.Writer.Error!void {
         // Reformat the cell which sets the proper pending wrap state. An
         // empty cell formats as nothing, so it is written as the blank it
         // draws as, with its semantic content set first as the cell
         // formatter would.
+        const rac = pin.rowAndCell();
         const cell = rac.cell;
         var cell_formatter: PageFormatter = .init(pin.node.page(), self.opts);
         cell_formatter.start_x = x;
@@ -942,6 +976,127 @@ pub const ScreenFormatter = struct {
         }
         try cell_formatter.format(writer);
     }
+
+    /// Put back a cursor outside the margins under origin mode, which CUP
+    /// reaches only within them. Only DECRC takes a cursor there (CUP, the
+    /// margins and origin mode itself home it within them), and from there
+    /// it moves only as far as the margins let a cursor outside them: so it
+    /// is put back where DECRC puts it, at the saved cursor written just
+    /// before, and moved to where it is. Returns false, having written
+    /// nothing, for a cursor within the margins or one that cannot have
+    /// come from the saved cursor.
+    fn formatCursorOutside(
+        self: ScreenFormatter,
+        t: *const Terminal,
+        writer: *std.Io.Writer,
+        cursor: Screen.Cursor,
+        may_save: bool,
+    ) std.Io.Writer.Error!bool {
+        const region = t.scrolling_region;
+        if (cursor.y >= region.top and cursor.y <= region.bottom and
+            cursor.x >= region.left and cursor.x <= region.right) return false;
+        const saved = self.screen.saved_cursor orelse return false;
+        if (!saved.origin) return false;
+        const stops: Stops = .{ .t = t };
+        const from_x = @min(saved.x, t.cols - 1);
+        const from_y = @min(saved.y, t.rows - 1);
+
+        // Where the moves take it: with a pending wrap, the cell it is set
+        // again from.
+        const pin = self.pendingWrapPin(cursor.x, cursor.y, cursor.pending_wrap);
+        const to_x = if (pin) |p| pendingWrapStart(p, cursor.x) else cursor.x;
+        const to_y = cursor.y;
+        if (to_y < from_y and to_y < stops.up(from_y)) return false;
+        if (to_y > from_y and to_y > stops.down(from_y)) return false;
+        if (to_x > from_x and to_x > stops.right(from_x)) return false;
+        if (to_x < from_x and to_x < stops.left(from_x)) return false;
+
+        // A move clears the saved pending wrap. Without one, DECRC leaves
+        // it, which is the cursor's own when it sits at the same cell, and
+        // is otherwise cleared by moving away and back.
+        const wrap_kept = saved.pending_wrap and to_x == from_x and to_y == from_y;
+        const at_cursor = wrap_kept and pin != null and to_x == cursor.x;
+        const clear: ?Bounce = if (wrap_kept and !at_cursor)
+            stops.bounce(from_x, from_y) orelse return false
+        else
+            null;
+
+        try writer.writeAll("\x1b8");
+        try formatSavedUndo(self.screen, saved, writer);
+        if (to_y < from_y) try writer.print("\x1b[{d}A", .{from_y - to_y});
+        if (to_y > from_y) try writer.print("\x1b[{d}B", .{to_y - from_y});
+        if (to_x > from_x) try writer.print("\x1b[{d}C", .{to_x - from_x});
+        if (to_x < from_x) {
+            // In a reverse wrap mode, CUB over a pending wrap moves one
+            // fewer.
+            const wrap_left = saved.pending_wrap and to_y == from_y and stops.reverseWrap();
+            try writer.print("\x1b[{d}D", .{from_x - to_x + @intFromBool(wrap_left)});
+        }
+        if (clear) |bounce| try writer.writeAll(bounce.bytes());
+        if (pin) |p| if (!at_cursor) try self.reprintPendingWrap(writer, p, cursor.x, to_x, false, may_save);
+        return true;
+    }
+
+    /// Where a cursor move (CUU, CUD, CUF, CUB) from a row or column stops,
+    /// as `Terminal` moves it: at the margin on that side when it starts
+    /// within it, else at the edge of the screen.
+    const Stops = struct {
+        t: *const Terminal,
+
+        fn up(self: Stops, y: size.CellCountInt) size.CellCountInt {
+            return if (y >= self.t.scrolling_region.top) self.t.scrolling_region.top else 0;
+        }
+
+        fn down(self: Stops, y: size.CellCountInt) size.CellCountInt {
+            return if (y <= self.t.scrolling_region.bottom) self.t.scrolling_region.bottom else self.t.rows - 1;
+        }
+
+        fn left(self: Stops, x: size.CellCountInt) size.CellCountInt {
+            return if (x >= self.t.scrolling_region.left) self.t.scrolling_region.left else 0;
+        }
+
+        fn right(self: Stops, x: size.CellCountInt) size.CellCountInt {
+            return if (x <= self.t.scrolling_region.right) self.t.scrolling_region.right else self.t.cols - 1;
+        }
+
+        /// Whether CUB wraps back over the start of a line.
+        fn reverseWrap(self: Stops) bool {
+            return self.t.modes.get(.wraparound) and
+                (self.t.modes.get(.reverse_wrap) or self.t.modes.get(.reverse_wrap_extended));
+        }
+
+        /// A move away from (`x`, `y`) and back that ends where it started,
+        /// which clears a pending wrap there. Null when the margins and the
+        /// edges stop every one.
+        fn bounce(self: Stops, x: size.CellCountInt, y: size.CellCountInt) ?Bounce {
+            if (self.right(x) > x and self.left(x + 1) <= x) return .right_left;
+            // CUB first, over the wrap: in a reverse wrap mode it moves one
+            // fewer.
+            if (self.left(x) < x and self.right(x - 1) >= x)
+                return if (self.reverseWrap()) .left_twice_right else .left_right;
+            if (self.up(y) < y and self.down(y - 1) >= y) return .up_down;
+            if (self.down(y) > y and self.up(y + 1) <= y) return .down_up;
+            return null;
+        }
+    };
+
+    const Bounce = enum {
+        right_left,
+        left_right,
+        left_twice_right,
+        up_down,
+        down_up,
+
+        fn bytes(self: Bounce) []const u8 {
+            return switch (self) {
+                .right_left => "\x1b[C\x1b[D",
+                .left_right => "\x1b[D\x1b[C",
+                .left_twice_right => "\x1b[2D\x1b[C",
+                .up_down => "\x1b[A\x1b[B",
+                .down_up => "\x1b[B\x1b[A",
+            };
+        }
+    };
 
     /// Give the cursor prompt content (OSC 133 P) on an active row whose
     /// prompt flag P sets again as it is. Returns whether one was found:
@@ -1016,15 +1171,26 @@ pub const ScreenFormatter = struct {
         const origin_set: []const u8 = if (saved.origin) "\x1b[?6h" else "\x1b[?6l";
         if (saved.origin != origin) try writer.writeAll(origin_set);
         // DECRC puts the cursor back by its screen position whatever the
-        // margins, and DECSC under origin mode saves a position within them.
+        // margins, and DECSC under origin mode saves a position within them,
+        // or outside them where DECRC put the cursor. CUP under origin mode
+        // reaches only within them, so the margins a position is outside of
+        // are lifted for the save and set again after it.
+        const x = @min(saved.x, self.screen.pages.cols - 1);
+        const y = @min(saved.y, self.screen.pages.rows - 1);
+        const region = t.scrolling_region;
+        const lift_rows = saved.origin and (y < region.top or y > region.bottom);
+        const lift_columns = saved.origin and (x < region.left or x > region.right) and
+            t.modes.get(.enable_left_and_right_margin);
+        if (lift_rows) try writer.writeAll("\x1b[r");
+        if (lift_columns) try writer.writeAll("\x1b[s");
         try self.formatCursorAt(
             writer,
-            @min(saved.x, self.screen.pages.cols - 1),
-            @min(saved.y, self.screen.pages.rows - 1),
+            x,
+            y,
             saved.pending_wrap,
             if (saved.origin) .{
-                .x = t.scrolling_region.left,
-                .y = t.scrolling_region.top,
+                .x = if (lift_columns) 0 else region.left,
+                .y = if (lift_rows) 0 else region.top,
             } else null,
             true,
         );
@@ -1032,14 +1198,28 @@ pub const ScreenFormatter = struct {
         if (saved.protected) try writer.writeAll("\x1b[1\"q");
         try formatCharsets(writer, saved.charset);
         try writer.writeAll("\x1b7");
+        try formatSavedUndo(self.screen, saved, writer);
+        const origin_back: []const u8 = if (origin) "\x1b[?6h" else "\x1b[?6l";
+        if (saved.origin != origin) try writer.writeAll(origin_back);
+        if (lift_rows) try writer.print("\x1b[{d};{d}r", .{ region.top + 1, region.bottom + 1 });
+        if (lift_columns) try writer.print("\x1b[{d};{d}s", .{ region.left + 1, region.right + 1 });
+    }
 
+    /// Give the pen, the protection and the character sets the saved state
+    /// set (by DECSC, or DECRC) back to the defaults, for the extras after
+    /// the cursor to set the cursor's own from.
+    fn formatSavedUndo(
+        screen: *const Screen,
+        saved: Screen.SavedCursor,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
         // No sequence designates UTF-8 into a slot again, so a slot the save
         // designated and the terminal holds at UTF-8 now gets ASCII, which
         // prints the same. A slot designated now is designated again by the
         // charsets extra.
         for (std.enums.values(charsets.Slots)) |slot| {
             if (saved.charset.charsets.get(slot) == .utf8) continue;
-            if (self.screen.charset.charsets.get(slot) != .utf8) continue;
+            if (screen.charset.charsets.get(slot) != .utf8) continue;
             try writer.writeAll(switch (slot) {
                 .G0 => "\x1b(B",
                 .G1 => "\x1b)B",
@@ -1052,8 +1232,6 @@ pub const ScreenFormatter = struct {
         if (saved.protected) try writer.writeAll("\x1b[0\"q");
         if (saved.charset.gl != .G0) try writer.writeAll("\x0f");
         if (saved.charset.gr != .G2) try writer.writeAll("\x1b}");
-        const origin_back: []const u8 = if (origin) "\x1b[?6h" else "\x1b[?6l";
-        if (saved.origin != origin) try writer.writeAll(origin_back);
     }
 
     /// Emit a character set state's designations and invocations that
@@ -6767,6 +6945,88 @@ test "Terminal vt cursor counts from the margins in origin mode" {
         try testing.expectEqual(want.x, got.x);
         try testing.expectEqual(want.y, got.y);
         try testing.expectEqual(want.pending_wrap, got.pending_wrap);
+    }
+}
+
+test "Terminal vt cursor and saved cursor outside the margins in origin mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Each saves the cursor under origin mode, then sets margins the saved
+    // position is outside of. Those after `\x1b8` put the cursor back
+    // there, and some move it on.
+    const save_above = "\x1b[?6h\x1b[1;3H\x1b7\x1b[2;5r";
+    const save_wrap = "\x1b[?6h0123456789\x1b7\x1b[2;5r";
+    const save_below = "\x1b[?6h\x1b[6;4H\x1b7\x1b[2;4r";
+    const save_left = "\x1b[?69h\x1b[?6h\x1b[3;1H\x1b7\x1b[4;8s";
+    const save_right = "\x1b[?69h\x1b[?6h\x1b[2;1H0123456789\x1b7\x1b[2;5s";
+    const save_wide = "\x1b[?6h01234567\xe4\xb8\x80\x1b7\x1b[2;5r";
+    for ([_][]const u8{
+        save_above,
+        save_wrap,
+        save_below,
+        save_left,
+        save_right,
+        save_wide,
+        // Saved under origin mode, which is off now.
+        save_above ++ "\x1b[?6l\x1b[4;4H",
+        save_above ++ "\x1b8",
+        save_above ++ "\x1b8\x1b[2C",
+        save_above ++ "\x1b8abc",
+        save_above ++ "\x1b8\x1b[9Cx",
+        save_wrap ++ "\x1b8",
+        // The saved wrap cleared in place, by ECH.
+        save_wrap ++ "\x1b8\x1b[X",
+        save_wrap ++ "\x1b[?45h\x1b8\x1b[X",
+        save_wrap ++ "\x1b[?45h\x1b8\x1b[3D",
+        save_below ++ "\x1b8\x1b[Aab",
+        save_left ++ "\x1b8\x1b[3A",
+        save_right ++ "\x1b8\x1b[2D",
+        save_wide ++ "\x1b8\x1b[X",
+        save_wide ++ "\x1b8\x1b[D\xe4\xb8\x80",
+    }) |input| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(input);
+
+        var target = try Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+        defer target.deinit(alloc);
+        try testReplayAll(&source, &target);
+        var target_stream = target.vtStream();
+        defer target_stream.deinit();
+
+        const At = struct { x: size.CellCountInt, y: size.CellCountInt, pending_wrap: bool, origin: bool };
+        for ([_]void{ {}, {} }, 0..) |_, round| {
+            const want_saved = source.screens.active.saved_cursor.?;
+            const got_saved = target.screens.active.saved_cursor.?;
+            try testing.expectEqual(
+                At{ .x = want_saved.x, .y = want_saved.y, .pending_wrap = want_saved.pending_wrap, .origin = want_saved.origin },
+                At{ .x = got_saved.x, .y = got_saved.y, .pending_wrap = got_saved.pending_wrap, .origin = got_saved.origin },
+            );
+            const want = &source.screens.active.cursor;
+            const got = &target.screens.active.cursor;
+            try testing.expectEqual(
+                At{ .x = want.x, .y = want.y, .pending_wrap = want.pending_wrap, .origin = source.modes.get(.origin) },
+                At{ .x = got.x, .y = got.y, .pending_wrap = got.pending_wrap, .origin = target.modes.get(.origin) },
+            );
+            try testing.expectEqual(source.scrolling_region, target.scrolling_region);
+            const plain_source = try source.plainString(alloc);
+            defer alloc.free(plain_source);
+            const plain_target = try target.plainString(alloc);
+            defer alloc.free(plain_target);
+            try testing.expectEqualStrings(plain_source, plain_target);
+
+            // What is written at the cursor, and then at the saved one, lands
+            // in the same cells in both.
+            if (round == 0) {
+                const next = "yz\x1b8w";
+                source_stream.nextSlice(next);
+                target_stream.nextSlice(next);
+            }
+        }
     }
 }
 
