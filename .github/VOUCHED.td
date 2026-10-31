@@ -56,6 +56,7 @@ aprilnea
 aredmondd
 arneshbanerjee
 arvin7liu
+aryanhamedani
 athaapa
 atomk
 aurelleb
@@ -128,6 +129,7 @@ douglas-macgregor
 drepper
 dungdm93
 dzhlobo
+edsarmiento
 ekaterinepapava
 ekusiadadus
 elias8
@@ -166,6 +168,7 @@ h3nock
 hackattack
 hakonhagland
 halosatrio
+hamidp
 heaths
 heddxh heddxh
 heitoraugustoln
@@ -408,6 +411,7 @@ yabbal
 yak3d
 yamshta
 ydah
+yeager
 -zaviro
 zenangst
 zenyr
