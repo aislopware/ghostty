@@ -1,3 +1,11 @@
+> [!NOTE]
+> **aislopware/ghostty** is where [onicode](https://github.com/aislopware/onicode)'s terminal core comes from. Only
+> `libghostty-vt` is built from it, as prebuilt static libraries that
+> [aislopware/libghostty-rs](https://github.com/aislopware/libghostty-rs) links by sha256. `main` is upstream's `main`
+> plus a short patch queue: xterm-accurate alternate screen modes, cursor and pin fixes for resize and reflow, OSC 133
+> prompt marks, and dirty-row tracking for incremental rendering. Onicode pins a rev on `main`. The pre-onicode
+> history is tagged `archive/main-pre-onicode`.
+
 <!-- LOGO -->
 <h1>
 <p align="center">
