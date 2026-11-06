@@ -19,7 +19,7 @@ const global = @import("global.zig");
 
 const log = std.log.scoped(.app);
 
-const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
+const SurfaceList = std.ArrayList(*apprt.Surface);
 
 /// General purpose allocator
 alloc: Allocator,
@@ -55,7 +55,7 @@ mailbox: Mailbox.Queue,
 font_grid_set: font.SharedGridSet,
 
 /// The app-scoped render device, shared by the renderers of all surfaces.
-device: renderer.Device,
+device: ?*renderer.Device,
 
 // Used to rate limit desktop notifications. Some platforms (notably macOS) will
 // run out of resources if desktop notifications are sent too fast and the OS
@@ -73,9 +73,7 @@ config_conditional_state: configpkg.ConditionalState,
 /// if they are the first surface.
 first: bool = true,
 
-pub const CreateError = Allocator.Error ||
-    font.SharedGridSet.InitError ||
-    error{DeviceFailed};
+pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
 
 /// Create a new app instance. This returns a stable pointer to the app
 /// instance which is required for callbacks.
@@ -130,16 +128,9 @@ pub fn init(
         .surfaces = .empty,
         .mailbox = .{},
         .font_grid_set = font_grid_set,
-        .device = undefined,
+        .device = null,
         .config_conditional_state = .{},
     };
-
-    // Initialize our render device.
-    self.device.init(alloc) catch |err| {
-        log.err("failed to initialize render device err={}", .{err});
-        return error.DeviceFailed;
-    };
-    errdefer self.device.deinit();
 }
 
 pub fn deinit(self: *App) void {
@@ -156,7 +147,7 @@ pub fn deinit(self: *App) void {
 
     // Clean up our render device. This must happen after all surfaces
     // are gone since their renderers borrow it.
-    self.device.deinit();
+    if (self.device) |dev| dev.deinit(self.alloc);
 }
 
 pub fn destroy(self: *App) void {
@@ -469,6 +460,16 @@ pub fn performAction(
             },
         ),
         .reload_config => _ = try rt_app.performAction(.app, .reload_config, .{}),
+        .set_window_theme => |v| _ = try rt_app.performAction(
+            .app,
+            .set_window_theme,
+            switch (v) {
+                .config => .config,
+                .system => .system,
+                .light => .light,
+                .dark => .dark,
+            },
+        ),
         .close_all_windows => _ = try rt_app.performAction(.app, .close_all_windows, {}),
         .toggle_quick_terminal => _ = try rt_app.performAction(.app, .toggle_quick_terminal, {}),
         .toggle_visibility => _ = try rt_app.performAction(.app, .toggle_visibility, {}),

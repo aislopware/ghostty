@@ -397,12 +397,51 @@ pub fn parse(parser: *Parser, _: ?u8) ?*OSCCommand {
             else => break :valid,
         }
 
+        // Past the buffer: keep the options that fit whole.
+        if (cap.truncated) {
+            const options = &parser.command.semantic_prompt.options_unvalidated;
+            options.* = options.*[0 .. std.mem.lastIndexOfScalar(u8, options.*, ';') orelse 0];
+        }
+
         return &parser.command;
     }
 
     // Any fallthroughs are invalid
     parser.state = .invalid;
     return null;
+}
+
+test "OSC 133: a step too long for the buffer keeps the options that fit" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    defer p.deinit();
+
+    const head = "133;C;aid=7;cmdline_url=";
+    for (head) |ch| p.next(ch);
+    for (0..Parser.MAX_BUF * 2) |_| p.next('x');
+
+    const cmd = p.end(0x07).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectEqualStrings("7", cmd.semantic_prompt.readOption(.aid).?);
+    try testing.expect(cmd.semantic_prompt.readOption(.cmdline_url) == null);
+}
+
+test "OSC 133: a cut option with no whole option before it leaves none" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    defer p.deinit();
+
+    const head = "133;D;0";
+    for (head) |ch| p.next(ch);
+    for (0..Parser.MAX_BUF) |_| p.next('0');
+
+    const cmd = p.end(0x07).?.*;
+    try testing.expect(cmd.semantic_prompt.action == .end_command);
+    try testing.expectEqualStrings("", cmd.semantic_prompt.options_unvalidated);
+    try testing.expect(cmd.semantic_prompt.readOption(.exit_code) == null);
 }
 
 test "OSC 133: end_input_start_output" {

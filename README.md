@@ -1,3 +1,11 @@
+> [!NOTE]
+> **aislopware/ghostty** is where [onicode](https://github.com/aislopware/onicode)'s terminal core comes from. Only
+> `libghostty-vt` is built from it, as prebuilt static libraries that
+> [aislopware/libghostty-rs](https://github.com/aislopware/libghostty-rs) links by sha256. `main` is upstream's `main`
+> plus a short patch queue: xterm-accurate alternate screen modes, cursor and pin fixes for resize and reflow, OSC 133
+> prompt marks, and dirty-row tracking for incremental rendering. Onicode pins a rev on `main`. The pre-onicode
+> history is tagged `archive/main-pre-onicode`.
+
 <!-- LOGO -->
 <h1>
 <p align="center">
@@ -165,9 +173,13 @@ for small examples of using `libghostty` in C and Zig or the
 complete example. See [awesome-libghostty](https://github.com/Uzaaft/awesome-libghostty)
 for a list of projects and resources related to `libghostty`.
 
-We haven't tagged libghostty with a version yet and we're still working
-on a better docs experience, but our [Doxygen website](https://libghostty.tip.ghostty.org/)
-is a good resource for the C API.
+`libghostty-vt` is released on its own, separately from Ghostty, with
+`vt-X.Y.Z` tags. To build or package it, see
+[`PACKAGING-LIBGHOSTTY.md`](PACKAGING-LIBGHOSTTY.md). To use it from a
+CMake project, see [`dist/cmake/README.md`](dist/cmake/README.md). We're
+still working on a better docs experience, but our
+[Doxygen website](https://libghostty.tip.ghostty.org/) is a good resource
+for the C API.
 
 #### Ghostty-only Terminal Control Sequences
 

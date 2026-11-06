@@ -43,7 +43,7 @@ pub const Operation = enum {
     osc_119,
 };
 
-/// Parse OSCs 4, 5, 10-19, 104, 110-119
+/// Parse OSCs 4, 5, 10-19, 104, 105, 110-119
 pub fn parse(parser: *Parser, terminator_ch: ?u8) ?*Command {
     const alloc = parser.alloc orelse {
         parser.state = .invalid;
@@ -70,6 +70,7 @@ pub fn parse(parser: *Parser, terminator_ch: ?u8) ?*Command {
         .@"18" => .osc_18,
         .@"19" => .osc_19,
         .@"104" => .osc_104,
+        .@"105" => .osc_105,
         .@"110" => .osc_110,
         .@"111" => .osc_111,
         .@"112" => .osc_112,
@@ -384,8 +385,7 @@ test "OSC 4:" {
         // Simple color set
         // printf '\e]4;0;red\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d};red",
                 .{idx},
             );
@@ -406,8 +406,7 @@ test "OSC 4:" {
         // Simple color query
         // printf '\e]4;0;?\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d};?",
                 .{idx},
             );
@@ -425,8 +424,7 @@ test "OSC 4:" {
         // Trailing invalid data produces results up to that point
         // printf '\e]4;0;red;\e\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d};red;",
                 .{idx},
             );
@@ -449,8 +447,7 @@ test "OSC 4:" {
         //
         // printf '\e]4;0;red \e\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d};red ",
                 .{idx},
             );
@@ -470,14 +467,13 @@ test "OSC 4:" {
     }
 
     // Test every special color
-    for (0..@typeInfo(SpecialColor).@"enum".fields.len) |i| {
+    for (0..@typeInfo(SpecialColor).@"enum".field_names.len) |i| {
         const special = std.enums.fromInt(SpecialColor, i) orelse return error.InvalidEnumValue;
 
         // Simple color set
         // printf '\e]4;256;red\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d};red",
                 .{256 + i},
             );
@@ -502,14 +498,13 @@ test "OSC 5:" {
     const alloc = testing.allocator;
 
     // Test every special color
-    for (0..@typeInfo(SpecialColor).@"enum".fields.len) |i| {
+    for (0..@typeInfo(SpecialColor).@"enum".field_names.len) |i| {
         const special = std.enums.fromInt(SpecialColor, i) orelse return error.InvalidEnumValue;
 
         // Simple color set
         // printf '\e]4;256;red\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d};red",
                 .{i},
             );
@@ -594,8 +589,7 @@ test "OSC 104:" {
         // Simple color set
         // printf '\e]104;0\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d}",
                 .{idx},
             );
@@ -612,14 +606,13 @@ test "OSC 104:" {
     }
 
     // Test every special color
-    for (0..@typeInfo(SpecialColor).@"enum".fields.len) |i| {
+    for (0..@typeInfo(SpecialColor).@"enum".field_names.len) |i| {
         const special = std.enums.fromInt(SpecialColor, i) orelse return error.InvalidEnumValue;
 
         // Simple color set
         // printf '\e]104;256\\'
         {
-            const body = try std.fmt.allocPrint(
-                alloc,
+            const body = try alloc.print(
                 "{d}",
                 .{256 + i},
             );
@@ -697,12 +690,10 @@ test "OSC 10: OSC 11: OSC 12: OSC: 13: OSC 14: OSC 15: OSC: 16: OSC 17: OSC 18: 
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    inline for (@typeInfo(DynamicColor).@"enum".fields) |field| {
-        const color = @field(DynamicColor, field.name);
-        const op = @field(Operation, std.fmt.comptimePrint(
-            "osc_{d}",
-            .{field.value},
-        ));
+    const info = @typeInfo(DynamicColor).@"enum";
+    inline for (info.field_names, info.field_values) |field, value| {
+        const color = @field(DynamicColor, field);
+        const op = @field(Operation, std.fmt.comptimePrint("osc_{d}", .{value}));
 
         // Example script:
         // printf '\e]10;red\e\\'
@@ -757,12 +748,10 @@ test "OSC 110: OSC 111: OSC 112: OSC: 113: OSC 114: OSC 115: OSC: 116: OSC 117: 
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    inline for (@typeInfo(DynamicColor).@"enum".fields) |field| {
-        const color = @field(DynamicColor, field.name);
-        const op = @field(Operation, std.fmt.comptimePrint(
-            "osc_1{d}",
-            .{field.value},
-        ));
+    const info = @typeInfo(DynamicColor).@"enum";
+    inline for (info.field_names, info.field_values) |field, value| {
+        const color = @field(DynamicColor, field);
+        const op = @field(Operation, std.fmt.comptimePrint("osc_1{d}", .{value}));
 
         // Example script:
         // printf '\e]110\e\\'
