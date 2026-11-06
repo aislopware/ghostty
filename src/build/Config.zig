@@ -920,11 +920,11 @@ fn libVersion(
 /// be used generally, it should only be used for Darwin-based OS currently.
 pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
     return switch (tag) {
-        // We support back to the earliest officially supported version
-        // of macOS by Apple. EOL versions are not supported.
+        // This fork builds for Onicode, which ships for macOS 27.2 and later
+        // only (upstream supports back to macOS 13).
         .macos => .{ .semver = .{
-            .major = 13,
-            .minor = 0,
+            .major = 27,
+            .minor = 2,
             .patch = 0,
         } },
 
@@ -939,8 +939,9 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
 /// This should only be used for Darwin targets.
 pub fn osVersionMinLibVt(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
     // lib-vt is the only thing we still build for iOS, so its deployment
-    // target lives here rather than in osVersionMin.
-    if (tag == .ios) return .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
+    // target lives here rather than in osVersionMin. Onicode, this fork's
+    // consumer, ships for iOS 27.2 and later only (upstream: iOS 13).
+    if (tag == .ios) return .{ .semver = .{ .major = 27, .minor = 2, .patch = 0 } };
     return osVersionMin(tag);
 }
 
