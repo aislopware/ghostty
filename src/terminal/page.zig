@@ -915,9 +915,20 @@ pub const Page = struct {
         const other_cells = src_row.cells.ptr(other.memory)[x_start..x_end];
         const cells = dst_row.cells.ptr(self.memory)[x_start..x_end];
 
+        // Whether the whole row is asked for, which is judged by the range
+        // requested rather than by what the narrower of the two pages lets us
+        // copy: a row cloned whole into a wider page (columns grown without
+        // reflow) is still the whole row and keeps its metadata, wrap
+        // included, as the in-place column growth does.
+        const whole = x_start == 0 and x_end_req >= self.size.cols;
+
         // If our destination has styles or graphemes then we need to
         // clear some state. This will free up the managed memory as well.
         if (dst_row.managedMemory()) self.clearCells(dst_row, x_start, x_end);
+
+        // A whole row from a narrower page leaves our cells past its width
+        // blank, so nothing stale outlives the row metadata copied below.
+        if (whole and x_end < self.size.cols) self.clearCells(dst_row, x_end, self.size.cols);
 
         // Copy all the row metadata but keep our cells offset
         dst_row.* = copy: {
@@ -925,7 +936,7 @@ pub const Page = struct {
 
             // If we're not copying the full row then we want to preserve
             // some original state from our dst row.
-            if ((x_end - x_start) < self.size.cols) {
+            if (!whole) {
                 copy.wrap = dst_row.wrap;
                 copy.wrap_continuation = dst_row.wrap_continuation;
                 copy.grapheme = dst_row.grapheme;
@@ -4657,6 +4668,51 @@ test "Page moveCells clears blank on the destination row" {
     page.moveCells(src.row, 0, dst, 2, 3);
     try testing.expect(!dst.blank);
     try page.verifyIntegrity(testing.allocator);
+}
+
+test "Page cloneRowFrom a narrower page keeps the row's wrap" {
+    // Regression test: growing columns without reflow takes the slow path
+    // when a page lacks the column capacity, and clones each row into a
+    // wider page. The clone copies fewer cells than the new width, which
+    // was read as a partial copy, so the rows lost their soft wraps (the
+    // in-place growth keeps them) and a wrapped line copied as two.
+    var src = try Page.init(.{
+        .cols = 6,
+        .rows = 2,
+        .styles = 8,
+    });
+    defer src.deinit();
+    var dst = try Page.init(.{
+        .cols = 7,
+        .rows = 2,
+        .styles = 8,
+    });
+    defer dst.deinit();
+
+    {
+        const rac = src.getRowAndCell(5, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'a' } },
+        };
+        rac.row.wrap = true;
+        src.getRow(1).wrap_continuation = true;
+    }
+
+    // A stale cell past the source's width is cleared by the clone.
+    dst.getRowAndCell(6, 0).cell.* = .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = .{ .data = 'z' } },
+    };
+
+    try dst.cloneRowFrom(&src, dst.getRow(0), src.getRow(0));
+    try dst.cloneRowFrom(&src, dst.getRow(1), src.getRow(1));
+    try testing.expect(dst.getRow(0).wrap);
+    try testing.expect(!dst.getRow(0).wrap_continuation);
+    try testing.expect(!dst.getRow(1).wrap);
+    try testing.expect(dst.getRow(1).wrap_continuation);
+    try testing.expectEqual('a', dst.getRowAndCell(5, 0).cell.content.codepoint.data);
+    try testing.expect(dst.getRowAndCell(6, 0).cell.isEmpty());
 }
 
 test "Page cloneRowFrom partial keeps blank only if both parts are blank" {
