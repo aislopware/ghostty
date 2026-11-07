@@ -16608,18 +16608,20 @@ test "PageList resize (no reflow) grow cols fast path with spacer head" {
     try s.resize(.{ .cols = 10, .reflow = false });
     try testing.expectEqual(@as(usize, 10), s.cols);
 
-    // Verify the old spacer_head positions are now narrow.
+    // Verify the old spacer_head positions are now narrow. The rows still
+    // wrap onto the wide characters that did not fit, as every other row
+    // keeps its wrap when columns grow.
     {
         const page = s.pages.first.?.page();
         {
             const rac = page.getRowAndCell(4, 0);
             try testing.expectEqual(pagepkg.Cell.Wide.narrow, rac.cell.wide);
-            try testing.expect(!rac.row.wrap);
+            try testing.expect(rac.row.wrap);
         }
         {
             const rac = page.getRowAndCell(4, 1);
             try testing.expectEqual(pagepkg.Cell.Wide.narrow, rac.cell.wide);
-            try testing.expect(!rac.row.wrap);
+            try testing.expect(rac.row.wrap);
         }
     }
 }
