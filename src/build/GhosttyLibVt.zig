@@ -8,7 +8,6 @@ const CombineArchivesStep = @import("CombineArchivesStep.zig");
 const LibsystemOverrideStep = @import("LibsystemOverrideStep.zig");
 const Config = @import("Config.zig");
 const GhosttyZig = @import("GhosttyZig.zig");
-const LipoStep = @import("LipoStep.zig");
 const SharedDeps = @import("SharedDeps.zig");
 const XCFrameworkStep = @import("XCFrameworkStep.zig");
 const GhosttyPkgConfig = @import("GhosttyPkgConfig.zig");
@@ -140,7 +139,7 @@ pub fn initShared(
 
 /// Apple platform targets for xcframework slices.
 pub const ApplePlatform = enum {
-    macos_universal,
+    macos,
     ios,
     ios_simulator,
     // tvOS, watchOS, and visionOS are not yet supported by Zig's
@@ -160,8 +159,9 @@ pub const ApplePlatform = enum {
 pub const AppleLibs = std.EnumMap(ApplePlatform, GhosttyLibVt);
 
 /// Build static libraries for all available Apple platforms.
-/// Always builds a macOS universal (arm64 + x86_64) fat binary.
-/// Additional platforms are included if their SDK is detected.
+/// Always builds macOS for arm64 only: this fork builds for Onicode, which
+/// ships for Apple silicon only (upstream builds an arm64 + x86_64 universal
+/// library). Additional platforms are included if their SDK is detected.
 pub fn initStaticAppleUniversal(
     b: *std.Build,
     cfg: *const Config,
@@ -170,37 +170,14 @@ pub fn initStaticAppleUniversal(
 ) !AppleLibs {
     var result: AppleLibs = .{};
 
-    // macOS universal (arm64 + x86_64)
+    // macOS arm64
     const aarch64_zig = try zig.retarget(
         b,
         cfg,
         deps,
         Config.genericMacOSTarget(b, .aarch64),
     );
-    const x86_64_zig = try zig.retarget(
-        b,
-        cfg,
-        deps,
-        Config.genericMacOSTarget(b, .x86_64),
-    );
-    const aarch64 = try initStatic(b, &aarch64_zig);
-    const x86_64 = try initStatic(b, &x86_64_zig);
-    const universal = LipoStep.create(b, .{
-        .name = "ghostty-vt",
-        .out_name = "libghostty-vt.a",
-        .input_a = aarch64.output,
-        .input_b = x86_64.output,
-    });
-    result.put(.macos_universal, .{
-        .step = universal.step,
-        .artifact = universal.step,
-        .kind = .static,
-        .output = universal.output,
-        .dsym = null,
-        .pkg_config = null,
-        .pkg_config_static = null,
-        .cmake = null,
-    });
+    result.put(.macos, try initStatic(b, &aarch64_zig));
 
     // Additional Apple platforms, each gated on SDK availability.
     for (ApplePlatform.sdk_platforms) |p| {

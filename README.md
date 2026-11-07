@@ -3,7 +3,9 @@
 > `libghostty-vt` is built from it, as prebuilt static libraries that
 > [aislopware/libghostty-rs](https://github.com/aislopware/libghostty-rs) links by sha256. `main` is upstream's `main`
 > plus a short patch queue: xterm-accurate alternate screen modes, cursor and pin fixes for resize and reflow, OSC 133
-> prompt marks, and dirty-row tracking for incremental rendering. Onicode pins a rev on `main`. The pre-onicode
+> prompt marks, and dirty-row tracking for incremental rendering. Its build targets macOS and iOS 27.2 and later on
+> Apple silicon only (owner ruling, 2026-11-07): lib-vt's Apple libraries are arm64 only, and upstream's other
+> platforms are left as upstream has them but never built here. Onicode pins a rev on `main`. The pre-onicode
 > history is tagged `archive/main-pre-onicode`.
 
 <!-- LOGO -->
