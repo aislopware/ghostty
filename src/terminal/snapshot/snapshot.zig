@@ -2580,3 +2580,50 @@ test "incremental decode failure leaves applied history usable" {
     primary.pages.assertIntegrity();
     primary.assertIntegrity();
 }
+
+test "complete snapshot reflows like its source after a clear and resizes" {
+    // The decoded terminal tracks its viewport pin on another row than the
+    // source does. With the viewport at the active area that pin means
+    // nothing, and it must not change how either terminal reflows: here it
+    // landed in the blanks after a line that exactly fills the narrower
+    // width and once soft-wrapped the line onto an extra row.
+    const testing = std.testing;
+    var source = try Terminal.init(testing.io, testing.allocator, .{ .cols = 6, .rows = 3 });
+    defer source.deinit(testing.allocator);
+    var source_stream = TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&source),
+        .continuation_max_bytes = 1024,
+    });
+    defer source_stream.deinit();
+    source_stream.nextSlice("  aa aaa    a\r\n");
+
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(testing.allocator, &encoded.writer, &source, test_encode_options);
+    var encoded_source: std.Io.Reader = .fixed(encoded.written());
+    var decoded = try decode(testing.allocator, testing.io, &encoded_source, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    var restored = decoded.toOwned();
+    defer restored.deinit(testing.allocator);
+    var restored_stream = TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&restored),
+        .continuation_max_bytes = 1024,
+    });
+    defer restored_stream.deinit();
+
+    source_stream.nextSlice("\x1b[2J");
+    restored_stream.nextSlice("\x1b[2J");
+    for ([_][2]size.CellCountInt{ .{ 7, 2 }, .{ 6, 4 } }) |dims| {
+        try source.resize(testing.allocator, .{ .cols = dims[0], .rows = dims[1] });
+        try restored.resize(testing.allocator, .{ .cols = dims[0], .rows = dims[1] });
+        const source_text = try source.plainString(testing.allocator);
+        defer testing.allocator.free(source_text);
+        const restored_text = try restored.plainString(testing.allocator);
+        defer testing.allocator.free(restored_text);
+        try testing.expectEqualStrings(source_text, restored_text);
+        try testing.expectEqual(source.screens.active.cursor.x, restored.screens.active.cursor.x);
+        try testing.expectEqual(source.screens.active.cursor.y, restored.screens.active.cursor.y);
+    }
+}
