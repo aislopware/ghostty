@@ -2335,6 +2335,7 @@ pub inline fn resize(
             .pin = self.cursor.page_pin,
         },
         .pull_scrollback = opts.pull_scrollback,
+        .saved_cursor = saved_cursor_pin,
     });
 
     // No more failures are possible after this. Enforced by compiler

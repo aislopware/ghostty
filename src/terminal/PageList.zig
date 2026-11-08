@@ -1263,6 +1263,13 @@ pub const Resize = struct {
     /// rows back and would otherwise get out of sync with us.
     pull_scrollback: bool = true,
 
+    /// A pin that marks where the next write lands, as a saved cursor does.
+    /// Like the cursor, reflow keeps the blanks before it, so it may carry
+    /// them onto a row of their own. Every other tracked pin is metadata (the
+    /// viewport, a selection, a search match) and never changes how text
+    /// reflows: one in the blanks stays on the row where the content ends.
+    saved_cursor: ?*Pin = null,
+
     pub const Cursor = struct {
         x: size.CellCountInt,
         y: size.CellCountInt,
@@ -1500,6 +1507,7 @@ fn resizeCols(
                 self,
                 row,
                 if (preserved_cursor) |c| c.tracked_pin else null,
+                opts.saved_cursor,
             );
 
             // Once we're done reflowing a page, we're done with it, so
@@ -1673,6 +1681,7 @@ const ReflowCursor = struct {
         list: *PageList,
         row: Pin,
         cursor_pin: ?*Pin,
+        saved_cursor: ?*Pin,
     ) Allocator.Error!void {
         const src_page: *Page = row.node.page();
         const src_row = row.rowAndCell().row;
@@ -1705,15 +1714,25 @@ const ReflowCursor = struct {
             // Deferred line breaks and pending wrap reset the destination column.
             const dst_x = if (self.new_rows > 0 or self.pending_wrap) 0 else self.x;
 
-            // A pin in the blanks on the right moves no further than the
-            // end of the dst row where the content ends. The content may
+            // A saved cursor in the blanks on the right moves no further than
+            // the end of the dst row where the content ends. The content may
             // wrap, so this is measured from where the content ends, not
             // from where the row starts, or the pin would land on content.
-            // It is fixed before the loop below grows cols_len, so every
-            // pin in the row gets the same bound.
+            // Content that exactly fills a dst row puts it on the next row,
+            // where the next write would go. Any other pin is metadata and
+            // stays within the rows the content takes, so it never adds a
+            // row: on the last of them, or on the first when there is no
+            // content. Both bounds are fixed before the loop below grows
+            // cols_len, so every pin in the row gets the same bound.
             const dst_cols: usize = self.page.size.cols;
             const content_end: usize = @as(usize, dst_x) + cols_len;
             const max_pin_x: usize = (content_end / dst_cols + 1) * dst_cols - 1 - dst_x;
+            const content_rows: usize = std.math.divCeil(
+                usize,
+                @max(content_end, 1),
+                dst_cols,
+            ) catch unreachable;
+            const max_metadata_x: usize = content_rows * dst_cols - 1 - dst_x;
 
             const pin_keys = list.tracked_pins.keys();
             for (pin_keys) |p| {
@@ -1724,7 +1743,11 @@ const ReflowCursor = struct {
 
                 if (cursor_pin != null and p == cursor_pin.?) continue;
 
-                if (p.x > max_pin_x) p.x = @intCast(max_pin_x);
+                const bound = if (saved_cursor != null and p == saved_cursor.?)
+                    max_pin_x
+                else
+                    max_metadata_x;
+                if (p.x > bound) p.x = @intCast(bound);
 
                 // We increase our col len to at least include this pin.
                 // This ensures that blank rows with pins are processed,
@@ -19160,13 +19183,63 @@ test "PageList resize reflow pins in blank cells after content that wraps" {
         } }).?);
         defer for (pins[0..case.pin_xs.len]) |p| s.untrackPin(p);
 
-        try s.resize(.{ .cols = case.cols, .reflow = true });
+        // The pins model saved cursors: where the next write lands.
+        try s.resize(.{ .cols = case.cols, .reflow = true, .saved_cursor = pins[0] });
         for (pins[0..case.pin_xs.len], case.expected) |p, expected| {
             try testing.expectEqual(
                 point.Point{ .active = expected },
                 s.pointFromPin(.active, p.*).?,
             );
             try testing.expect(p.rowAndCell().cell.isEmpty());
+        }
+    }
+}
+
+test "PageList resize reflow never adds a row for a metadata pin in blank cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct {
+        src_cols: size.CellCountInt,
+        text: []const u8,
+        pin_x: size.CellCountInt,
+        cols: size.CellCountInt,
+        expected: point.Coordinate,
+    }{
+        // Content that exactly fills the dst row: a saved cursor would go on
+        // the next row, a metadata pin stays on the content's last cell.
+        .{ .src_cols = 7, .text = "  aa a", .pin_x = 6, .cols = 6, .expected = .{ .x = 5, .y = 0 } },
+        // Content that wraps: the pin stays on the row where it ends.
+        .{ .src_cols = 8, .text = "abcde", .pin_x = 7, .cols = 3, .expected = .{ .x = 2, .y = 1 } },
+        // A blank row: the pin stays on it.
+        .{ .src_cols = 8, .text = "", .pin_x = 7, .cols = 4, .expected = .{ .x = 3, .y = 0 } },
+        // Room left in the dst row: the pin keeps its column.
+        .{ .src_cols = 8, .text = "ab", .pin_x = 3, .cols = 6, .expected = .{ .x = 3, .y = 0 } },
+    };
+
+    for (cases) |case| {
+        var s = try init(alloc, .{ .cols = case.src_cols, .rows = 4 });
+        defer s.deinit();
+        const page = s.pages.first.?.page();
+        for (case.text, 0..) |cp, x| {
+            page.getRowAndCell(x, 0).cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = cp } },
+            };
+        }
+        const tracked = try s.trackPin(s.pin(.{ .active = .{ .x = case.pin_x, .y = 0 } }).?);
+        defer s.untrackPin(tracked);
+
+        try s.resize(.{ .cols = case.cols, .reflow = true });
+        try testing.expectEqual(
+            point.Point{ .active = case.expected },
+            s.pointFromPin(.active, tracked.*).?,
+        );
+        // No row of the content is soft-wrapped onto a row of blanks.
+        const last_row = (case.text.len + case.cols - 1) / case.cols;
+        if (last_row > 0) {
+            const end = s.pin(.{ .active = .{ .y = @intCast(last_row - 1) } }).?;
+            try testing.expect(!end.rowAndCell().row.wrap);
         }
     }
 }
